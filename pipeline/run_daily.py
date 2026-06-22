@@ -1,0 +1,179 @@
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import re
+import sys
+from dataclasses import asdict
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+import pandas as pd
+import yaml
+
+from storage.paths import browser_profile_dir, ensure_dirs, get_project_root, normalize_date, raw_dir
+from collector.search_page_collector import collect_keyword, enrich_items
+
+
+def safe_filename(text: str) -> str:
+    cleaned = re.sub(r'[\\/:*?"<>|]+', "_", text).strip()
+    return cleaned[:60] or "keyword"
+
+
+def load_domains_config(path: Path | None = None) -> dict[str, Any]:
+    config_path = path or get_project_root() / "config" / "domains.yaml"
+    if not config_path.exists():
+        raise FileNotFoundError(f"找不到配置文件：{config_path}")
+    return yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+
+
+def get_domain(config: dict[str, Any], domain_id: str) -> dict[str, Any]:
+    for domain in config.get("domains", []):
+        if domain.get("id") == domain_id:
+            return domain
+    available = ", ".join(d.get("id", "") for d in config.get("domains", []))
+    raise ValueError(f"找不到 domain={domain_id}。可用 domain：{available or '无'}")
+
+
+def pick_keywords(domain: dict[str, Any], limit: int | None = None) -> list[str]:
+    keywords = [str(k).strip() for k in domain.get("seed_keywords", []) if str(k).strip()]
+    collection = domain.get("collection", {}) or {}
+    keyword_limit = limit or int(collection.get("keywords_per_day") or len(keywords))
+    return keywords[:keyword_limit]
+
+
+def rows_to_frame(rows: list[dict[str, Any]]) -> pd.DataFrame:
+    columns = [
+        "crawl_date",
+        "crawl_time",
+        "domain_id",
+        "domain_name",
+        "keyword",
+        "rank",
+        "title",
+        "author",
+        "publish_time",
+        "publish_date",
+        "link",
+        "note_id",
+        "cover_url",
+        "like_count",
+        "collect_count",
+        "comment_count",
+        "interaction_count",
+        "data_attrs",
+        "visible_text",
+        "extract_method",
+        "quality_flags",
+        "source_file",
+    ]
+    return pd.DataFrame(rows, columns=columns)
+
+
+def save_keyword_raw(rows: list[dict[str, Any]], output_base: Path) -> None:
+    output_base.parent.mkdir(parents=True, exist_ok=True)
+    df = rows_to_frame(rows)
+    xlsx_path = output_base.with_suffix(".xlsx")
+    json_path = output_base.with_suffix(".json")
+    df.to_excel(xlsx_path, index=False)
+    json_path.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"已保存关键词原始数据：{xlsx_path}")
+    print(f"已保存关键词 JSON：{json_path}")
+
+
+async def run_daily(args: argparse.Namespace) -> int:
+    config = load_domains_config(args.config)
+    domain = get_domain(config, args.domain)
+    project_id = args.domain
+    collection = domain.get("collection", {}) or {}
+    date_str = normalize_date(args.date)
+    ensure_dirs(date_str, project_id)
+
+    keywords = pick_keywords(domain, args.keywords_per_day)
+    if not keywords:
+        print("配置中没有可采集的关键词。", file=sys.stderr)
+        return 2
+
+    notes_per_keyword = args.notes_per_keyword or int(collection.get("notes_per_keyword") or 50)
+    max_daily_notes = args.max_daily_notes or int(collection.get("max_daily_notes") or 0)
+    login_timeout = args.login_timeout or int(collection.get("login_timeout") or 180)
+    slow_mo = args.slow_mo if args.slow_mo is not None else int(collection.get("slow_mo") or 0)
+    headless = args.headless or bool(collection.get("headless") or False)
+    profile_dir = (
+        (get_project_root() / collection["profile_dir"]).resolve()
+        if collection.get("profile_dir")
+        else browser_profile_dir(project_id).resolve()
+    )
+
+    all_rows: list[dict[str, Any]] = []
+    print(f"开始采集领域：{domain.get('name', args.domain)}（{args.domain}）")
+    print(f"采集日期：{date_str}；关键词数：{len(keywords)}；每词目标：{notes_per_keyword}")
+
+    for index, keyword in enumerate(keywords, start=1):
+        remaining = max_daily_notes - len(all_rows) if max_daily_notes else notes_per_keyword
+        if max_daily_notes and remaining <= 0:
+            print(f"已达到 max_daily_notes={max_daily_notes}，停止继续采集。")
+            break
+        count = min(notes_per_keyword, remaining) if max_daily_notes else notes_per_keyword
+        crawl_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[{index}/{len(keywords)}] 搜索关键词：{keyword}，目标 {count} 条")
+
+        items = await collect_keyword(
+            keyword=keyword,
+            count=count,
+            profile_dir=profile_dir,
+            headless=headless,
+            login_timeout=login_timeout,
+            slow_mo=slow_mo,
+        )
+        file_stem = f"{date_str}_{args.domain}_{index:02d}_{safe_filename(keyword)}"
+        source_file = str((raw_dir(date_str, project_id) / f"{file_stem}.xlsx").resolve())
+        enrich_items(
+            items,
+            crawl_date=date_str,
+            crawl_time=crawl_time,
+            domain_id=args.domain,
+            domain_name=str(domain.get("name") or ""),
+            source_file=source_file,
+        )
+        rows = [asdict(item) for item in items]
+        save_keyword_raw(rows, raw_dir(date_str, project_id) / file_stem)
+        all_rows.extend(rows)
+
+    all_df = rows_to_frame(all_rows)
+    all_xlsx = raw_dir(date_str, project_id) / "all_raw.xlsx"
+    all_json = raw_dir(date_str, project_id) / "all_raw.json"
+    all_df.to_excel(all_xlsx, index=False)
+    all_json.write_text(json.dumps(all_rows, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"已合并当天原始 Excel：{all_xlsx}")
+    print(f"已合并当天原始 JSON：{all_json}")
+    print(f"完成：共采集 {len(all_rows)} 条。")
+    return 0
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="按领域配置批量采集小红书搜索结果页原始数据。")
+    parser.add_argument("--domain", required=True, help="领域 id，例如 camping")
+    parser.add_argument("--date", default="today", help="采集日期，默认 today")
+    parser.add_argument("--config", type=Path, default=None, help="domains.yaml 路径")
+    parser.add_argument("--keywords-per-day", type=int, default=None, help="覆盖配置中的 keywords_per_day")
+    parser.add_argument("--notes-per-keyword", type=int, default=None, help="覆盖配置中的 notes_per_keyword")
+    parser.add_argument("--max-daily-notes", type=int, default=None, help="覆盖配置中的 max_daily_notes")
+    parser.add_argument("--login-timeout", type=int, default=None, help="覆盖配置中的 login_timeout")
+    parser.add_argument("--slow-mo", type=int, default=None, help="覆盖配置中的 slow_mo")
+    parser.add_argument("--headless", action="store_true", help="覆盖配置，使用无头模式")
+    return parser.parse_args()
+
+
+def main() -> int:
+    try:
+        return asyncio.run(run_daily(parse_args()))
+    except KeyboardInterrupt:
+        print("用户中断。")
+        return 130
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

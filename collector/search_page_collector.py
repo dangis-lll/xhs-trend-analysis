@@ -1,0 +1,491 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import re
+import time
+from dataclasses import asdict, dataclass
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any
+from urllib.parse import quote, urljoin
+
+import pandas as pd
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+from playwright.async_api import async_playwright
+
+
+XHS_HOME = "https://www.xiaohongshu.com"
+DEFAULT_PROFILE_DIR = Path("browser_profile").resolve()
+
+
+@dataclass
+class NoteItem:
+    keyword: str
+    crawl_date: str = ""
+    crawl_time: str = ""
+    domain_id: str = ""
+    domain_name: str = ""
+    rank: int = 0
+    title: str = ""
+    author: str = ""
+    publish_time: str = ""
+    publish_date: str = ""
+    link: str = ""
+    note_id: str = ""
+    cover_url: str = ""
+    like_count: str = ""
+    collect_count: str = ""
+    comment_count: str = ""
+    interaction_count: str = ""
+    data_attrs: str = ""
+    visible_text: str = ""
+    extract_method: str = "search_page_card"
+    quality_flags: str = ""
+    source_file: str = ""
+
+
+def build_search_url(keyword: str) -> str:
+    return (
+        f"{XHS_HOME}/search_result?keyword={quote(keyword)}"
+        "&source=web_search_result_notes"
+    )
+
+
+def normalize_space(text: str | None) -> str:
+    return re.sub(r"\s+", " ", text or "").strip()
+
+
+def note_id_from_url(url: str) -> str:
+    match = re.search(r"/(?:explore|discovery/item)/([^/?#]+)", url)
+    return match.group(1) if match else ""
+
+
+def pick_publish_time(text: str) -> str:
+    patterns = [
+        r"\d{4}[-/.年]\d{1,2}[-/.月]\d{1,2}日?",
+        r"\d{1,2}[-/.月]\d{1,2}日?",
+        r"\d+\s*(?:秒|分钟|小时|天|周|个月|年)前",
+        r"(?:刚刚|昨天|前天)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            return match.group(0)
+    return ""
+
+
+def normalize_publish_date(raw_time: str, now: datetime | None = None) -> str:
+    now = now or datetime.now()
+    text = normalize_space(raw_time)
+    if not text:
+        return ""
+
+    full_date = re.search(r"(\d{4})[-/.年](\d{1,2})[-/.月](\d{1,2})日?", text)
+    if full_date:
+        year, month, day = map(int, full_date.groups())
+        return f"{year:04d}-{month:02d}-{day:02d}"
+
+    month_day = re.search(r"(?<!\d)(\d{1,2})[-/.月](\d{1,2})日?", text)
+    if month_day:
+        month, day = map(int, month_day.groups())
+        year = now.year
+        try:
+            candidate = datetime(year, month, day)
+        except ValueError:
+            return ""
+        if candidate.date() > now.date():
+            candidate = datetime(year - 1, month, day)
+        return candidate.strftime("%Y-%m-%d")
+
+    if "刚刚" in text:
+        return now.strftime("%Y-%m-%d")
+    if "昨天" in text:
+        return (now - timedelta(days=1)).strftime("%Y-%m-%d")
+    if "前天" in text:
+        return (now - timedelta(days=2)).strftime("%Y-%m-%d")
+
+    relative = re.search(r"(\d+)\s*(秒|分钟|小时|天|周|个月|年)前", text)
+    if relative:
+        amount = int(relative.group(1))
+        unit = relative.group(2)
+        if unit in {"秒", "分钟", "小时"}:
+            delta = timedelta(days=0)
+        elif unit == "天":
+            delta = timedelta(days=amount)
+        elif unit == "周":
+            delta = timedelta(days=amount * 7)
+        elif unit == "个月":
+            delta = timedelta(days=amount * 30)
+        else:
+            delta = timedelta(days=amount * 365)
+        return (now - delta).strftime("%Y-%m-%d")
+
+    return ""
+
+
+def pick_metric(text: str, names: list[str]) -> str:
+    for name in names:
+        patterns = [
+            rf"{name}\s*[:：]?\s*([0-9.]+万?)",
+            rf"([0-9.]+万?)\s*{name}",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text)
+            if match:
+                return match.group(1)
+    return ""
+
+
+def dedupe_notes(items: list[NoteItem]) -> list[NoteItem]:
+    seen: set[str] = set()
+    unique: list[NoteItem] = []
+    for item in items:
+        key = item.note_id or item.link or f"{item.title}|{item.author}|{item.visible_text[:80]}"
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        unique.append(item)
+    return unique
+
+
+def enrich_items(
+    items: list[NoteItem],
+    *,
+    crawl_date: str = "",
+    crawl_time: str = "",
+    domain_id: str = "",
+    domain_name: str = "",
+    source_file: str = "",
+) -> list[NoteItem]:
+    for item in items:
+        item.crawl_date = crawl_date
+        item.crawl_time = crawl_time
+        item.domain_id = domain_id
+        item.domain_name = domain_name
+        item.source_file = source_file
+        flags: list[str] = []
+        if not item.title:
+            flags.append("missing_title")
+        if not item.link:
+            flags.append("missing_link")
+        if not item.publish_date:
+            flags.append("missing_publish_date")
+        if not item.like_count:
+            flags.append("missing_like_count")
+        item.quality_flags = ",".join(flags)
+    return items
+
+
+async def extract_notes_from_page(page: Any, keyword: str) -> list[NoteItem]:
+    raw_items = await page.evaluate(
+        """
+        () => {
+          const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+          const abs = (href) => {
+            try { return new URL(href, location.origin).href; } catch { return href || ''; }
+          };
+          const cardSelectors = [
+            'section.note-item',
+            '.note-item',
+            '[class*="note-item"]',
+            '[data-note-id]',
+            '[data-id]'
+          ];
+          const titleSelectors = [
+            '.title',
+            '[class*="title"]',
+            'a[href*="/explore/"] span',
+            'a[href*="/discovery/item/"] span'
+          ];
+          const authorSelectors = [
+            '.author .name',
+            '.author-wrapper .name',
+            '[class*="author"] [class*="name"]',
+            '[class*="user"] [class*="name"]',
+            '[class*="nickname"]'
+          ];
+          const timeSelectors = [
+            '.time',
+            '.date',
+            '[class*="time"]',
+            '[class*="date"]'
+          ];
+          const likeSelectors = [
+            '.like-wrapper',
+            '.like',
+            '[class*="like"]',
+            '[class*="count"]'
+          ];
+          const collectSelectors = [
+            '[class*="collect"]',
+            '[class*="favorite"]',
+            '[class*="star"]'
+          ];
+          const commentSelectors = [
+            '[class*="comment"]'
+          ];
+
+          const imageUrl = (img) => {
+            if (!img) return '';
+            const src = img.currentSrc || img.src || img.getAttribute('src') || '';
+            const dataSrc = img.getAttribute('data-src') || img.getAttribute('data-original') || '';
+            const srcset = img.getAttribute('srcset') || '';
+            if (src) return abs(src);
+            if (dataSrc) return abs(dataSrc);
+            if (srcset) return abs(srcset.split(',')[0].trim().split(' ')[0]);
+            return '';
+          };
+          const getFirstText = (card, selectors, maxLen = 60) => {
+            for (const selector of selectors) {
+              const node = card.querySelector(selector);
+              const text = norm(node && node.innerText);
+              if (text && text.length <= maxLen) return text;
+              const label = norm(node && (node.getAttribute('aria-label') || node.getAttribute('title')));
+              if (label && label.length <= maxLen) return label;
+            }
+            return '';
+          };
+          const dataAttrs = (card) => {
+            const out = {};
+            for (const el of [card, ...Array.from(card.querySelectorAll('*')).slice(0, 40)]) {
+              for (const attr of Array.from(el.attributes || [])) {
+                if (attr.name.startsWith('data-') && attr.value && attr.value.length <= 300) {
+                  out[attr.name] = attr.value;
+                }
+              }
+            }
+            return out;
+          };
+
+          const anchors = Array.from(document.querySelectorAll(
+            'a[href*="/explore/"], a[href*="/discovery/item/"]'
+          ));
+
+          const cards = [];
+          for (const anchor of anchors) {
+            let card = null;
+            for (const selector of cardSelectors) {
+              card = anchor.closest(selector);
+              if (card) break;
+            }
+            if (!card) {
+              let node = anchor.parentElement;
+              for (let i = 0; node && i < 5; i += 1, node = node.parentElement) {
+                const txt = norm(node.innerText);
+                if (txt.length >= 5 && txt.length <= 600) {
+                  card = node;
+                  break;
+                }
+              }
+            }
+            if (card && !cards.includes(card)) cards.push(card);
+          }
+
+          return cards.map((card, index) => {
+            const linkNode = card.querySelector(
+              'a[href*="/explore/"], a[href*="/discovery/item/"]'
+            );
+            let title = '';
+            for (const selector of titleSelectors) {
+              const node = card.querySelector(selector);
+              const text = norm(node && node.innerText);
+              if (text && text.length <= 120) {
+                title = text;
+                break;
+              }
+            }
+            if (!title && linkNode) title = norm(linkNode.innerText).split(' ')[0] || '';
+
+            let author = '';
+            for (const selector of authorSelectors) {
+              const node = card.querySelector(selector);
+              const text = norm(node && node.innerText);
+              if (text && text !== title && text.length <= 60) {
+                author = text;
+                break;
+              }
+            }
+
+            const publish_time = getFirstText(card, timeSelectors, 40);
+            const cover_url = imageUrl(card.querySelector('img'));
+            const like_count = getFirstText(card, likeSelectors, 40);
+            const collect_count = getFirstText(card, collectSelectors, 40);
+            const comment_count = getFirstText(card, commentSelectors, 40);
+
+            return {
+              rank: index + 1,
+              title,
+              author,
+              publish_time,
+              link: abs(linkNode && linkNode.getAttribute('href')),
+              cover_url,
+              like_count,
+              collect_count,
+              comment_count,
+              data_attrs: dataAttrs(card),
+              visible_text: norm(card.innerText)
+            };
+          }).filter((item) => item.link || item.title || item.visible_text);
+        }
+        """
+    )
+
+    items: list[NoteItem] = []
+    for raw in raw_items:
+        link = normalize_space(raw.get("link"))
+        visible_text = normalize_space(raw.get("visible_text"))
+        publish_time = normalize_space(raw.get("publish_time")) or pick_publish_time(visible_text)
+        publish_date = normalize_publish_date(publish_time)
+        like_count = normalize_space(raw.get("like_count")) or pick_metric(visible_text, ["点赞", "赞"])
+        collect_count = normalize_space(raw.get("collect_count")) or pick_metric(visible_text, ["收藏"])
+        comment_count = normalize_space(raw.get("comment_count")) or pick_metric(visible_text, ["评论"])
+        interaction_count = like_count or pick_metric(visible_text, ["互动", "赞过"])
+        items.append(
+            NoteItem(
+                keyword=keyword,
+                rank=int(raw.get("rank") or 0),
+                title=normalize_space(raw.get("title")),
+                author=normalize_space(raw.get("author")),
+                publish_time=publish_time,
+                publish_date=publish_date,
+                link=urljoin(XHS_HOME, link) if link else "",
+                note_id=note_id_from_url(link),
+                cover_url=normalize_space(raw.get("cover_url")),
+                like_count=like_count,
+                collect_count=collect_count,
+                comment_count=comment_count,
+                interaction_count=interaction_count,
+                data_attrs=json.dumps(raw.get("data_attrs") or {}, ensure_ascii=False),
+                visible_text=visible_text,
+            )
+        )
+    return dedupe_notes(items)
+
+
+async def maybe_accept_manual_login(page: Any, login_timeout: int) -> None:
+    print("如果页面要求登录或验证码，请在打开的 Chrome 里手动完成。")
+    print(f"程序会等待最多 {login_timeout} 秒，然后继续抓取搜索结果。")
+    end = time.time() + login_timeout
+    while time.time() < end:
+        try:
+            url = page.url
+            text = await page.locator("body").inner_text(timeout=1000)
+            if "登录" not in text[:1000] and "验证码" not in text[:1000]:
+                return
+            print("仍在等待登录/验证完成...")
+        except Exception:
+            pass
+        await asyncio.sleep(5)
+
+
+async def collect_keyword(
+    keyword: str,
+    count: int,
+    profile_dir: Path,
+    headless: bool,
+    login_timeout: int,
+    slow_mo: int,
+) -> list[NoteItem]:
+    async with async_playwright() as p:
+        try:
+            context = await p.chromium.launch_persistent_context(
+                user_data_dir=str(profile_dir),
+                channel="chrome",
+                headless=headless,
+                chromium_sandbox=True,
+                slow_mo=slow_mo,
+                viewport={"width": 1440, "height": 1000},
+                locale="zh-CN",
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--start-maximized",
+                ],
+            )
+        except Exception:
+            context = await p.chromium.launch_persistent_context(
+                user_data_dir=str(profile_dir),
+                headless=headless,
+                chromium_sandbox=True,
+                slow_mo=slow_mo,
+                viewport={"width": 1440, "height": 1000},
+                locale="zh-CN",
+                args=["--disable-blink-features=AutomationControlled"],
+            )
+
+        page = context.pages[0] if context.pages else await context.new_page()
+        page.set_default_timeout(15_000)
+
+        await page.goto(build_search_url(keyword), wait_until="domcontentloaded")
+        await maybe_accept_manual_login(page, login_timeout)
+
+        try:
+            await page.wait_for_load_state("networkidle", timeout=20_000)
+        except PlaywrightTimeoutError:
+            pass
+
+        items: list[NoteItem] = []
+        last_size = 0
+        stale_rounds = 0
+        max_rounds = max(12, min(80, count * 3))
+
+        for round_index in range(max_rounds):
+            batch = await extract_notes_from_page(page, keyword)
+            items = dedupe_notes([*items, *batch])
+            print(f"第 {round_index + 1} 轮：已提取 {len(items)}/{count} 条")
+
+            if len(items) >= count:
+                break
+
+            if len(items) == last_size:
+                stale_rounds += 1
+            else:
+                stale_rounds = 0
+            last_size = len(items)
+
+            if stale_rounds >= 6:
+                print("连续多轮没有新增结果，提前结束。")
+                break
+
+            await page.mouse.wheel(0, 1600)
+            await page.wait_for_timeout(1800)
+
+        await context.close()
+        return items[:count]
+
+
+def save_outputs(items: list[NoteItem], output: Path) -> None:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    rows = [asdict(item) for item in items]
+    df = pd.DataFrame(
+        rows,
+        columns=[
+            "crawl_date",
+            "crawl_time",
+            "domain_id",
+            "domain_name",
+            "keyword",
+            "rank",
+            "title",
+            "author",
+            "publish_time",
+            "publish_date",
+            "link",
+            "note_id",
+            "cover_url",
+            "like_count",
+            "collect_count",
+            "comment_count",
+            "interaction_count",
+            "data_attrs",
+            "visible_text",
+            "extract_method",
+            "quality_flags",
+            "source_file",
+        ],
+    )
+    df.to_excel(output, index=False)
+    json_path = output.with_suffix(".json")
+    json_path.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"已保存 Excel：{output}")
+    print(f"已保存 JSON 备份：{json_path}")

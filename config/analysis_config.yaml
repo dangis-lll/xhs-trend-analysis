@@ -1,0 +1,12 @@
+analysis:
+  trend_min_days: 3
+  high_like_threshold: 1000
+  semantic_similarity_threshold: 0.88
+  recent_publish_days: 7
+  top_topics: 10
+  top_cases: 10
+  enable_ocr: false
+  enable_multimodal: false
+  enable_llm_report: false
+  enable_detail_cases: false
+  max_detail_cases: 0

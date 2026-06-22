@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+
+.agents/
+.codex/
+
+.env
+.env.*
+
+browser_profile/
+projects/
+output/
+data/
+reports/
+knowledge-base/
+
+*.log
