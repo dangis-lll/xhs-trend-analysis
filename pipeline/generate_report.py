@@ -62,6 +62,12 @@ def md_list(items) -> list[str]:
             title = (
                 item.get("title")
                 or item.get("topic")
+                or item.get("trend")
+                or item.get("hotspot")
+                or item.get("pattern")
+                or item.get("action")
+                or item.get("idea")
+                or item.get("risk")
                 or item.get("keyword")
                 or item.get("summary")
                 or item.get("insight")
@@ -72,6 +78,14 @@ def md_list(items) -> list[str]:
             evidence = (
                 item.get("evidence")
                 or item.get("reason")
+                or item.get("why")
+                or item.get("drivers")
+                or item.get("trigger")
+                or item.get("signal_value")
+                or item.get("impact")
+                or item.get("mitigation")
+                or item.get("expected_signal")
+                or item.get("based_on_signal")
                 or item.get("analysis")
                 or item.get("suggestion")
                 or item.get("content")
@@ -138,8 +152,11 @@ def main() -> int:
             {
                 "metrics": metrics,
                 "top_notes": top_notes,
+                "top_collected_notes": metrics.get("top_collected_notes", []),
+                "top_discussed_notes": metrics.get("top_discussed_notes", []),
                 "terms": metrics.get("top_title_terms", []),
                 "trends": trends,
+                "data_scope": "search_page_only",
             },
         )
 
@@ -154,6 +171,8 @@ def main() -> int:
             f"- 有标准发布时间的样本 {metrics.get('publish_date_present_count', 0)} 条，占比 {metrics.get('publish_date_present_rate', 0):.2%}。",
             f"- 近 {metrics.get('recent_publish_days', 7)} 天发布样本 {metrics.get('recent_publish_count', 0)} 条，占比 {metrics.get('recent_publish_ratio', 0):.2%}。",
             f"- 平均点赞 {metrics.get('avg_likes', 0)}，中位数点赞 {metrics.get('median_likes', 0)}，P90 点赞 {metrics.get('p90_likes', 0)}。",
+            f"- 收藏/点赞比 {metrics.get('collect_like_ratio', 0):.2%}，评论/点赞比 {metrics.get('comment_like_ratio', 0):.2%}，分享/点赞比 {metrics.get('share_like_ratio', 0):.2%}。",
+            f"- 视频样本 {metrics.get('video_count', 0)} 条，占比 {metrics.get('video_rate', 0):.2%}；图文样本 {metrics.get('image_note_count', 0)} 条，占比 {metrics.get('image_note_rate', 0):.2%}。",
             "",
             "## 数据概览",
             "",
@@ -163,6 +182,9 @@ def main() -> int:
                     {"name": "去重后样本数", "value": metrics.get("clean_count", 0)},
                     {"name": "高赞笔记数", "value": metrics.get("high_like_count", 0)},
                     {"name": "高赞率", "value": f"{metrics.get('high_like_rate', 0):.2%}"},
+                    {"name": "收藏/点赞比", "value": f"{metrics.get('collect_like_ratio', 0):.2%}"},
+                    {"name": "评论/点赞比", "value": f"{metrics.get('comment_like_ratio', 0):.2%}"},
+                    {"name": "视频占比", "value": f"{metrics.get('video_rate', 0):.2%}"},
                 ],
                 ["name", "value"],
                 ["指标", "数值"],
@@ -171,8 +193,22 @@ def main() -> int:
             "",
             md_table(
                 top_notes,
-                ["title", "author", "keyword", "publish_date", "like_count_num", "link"],
-                ["标题", "作者", "关键词", "发布日期", "点赞", "链接"],
+                ["title", "author", "keyword", "publish_date", "like_count_num", "collect_count_num", "comment_count_num", "note_type", "link"],
+                ["标题", "作者", "关键词", "发布日期", "点赞", "收藏", "评论", "类型", "链接"],
+            ),
+            "## 高收藏笔记 Top 10",
+            "",
+            md_table(
+                metrics.get("top_collected_notes", [])[:10],
+                ["title", "author", "keyword", "collect_count_num", "like_count_num", "comment_count_num", "link"],
+                ["标题", "作者", "关键词", "收藏", "点赞", "评论", "链接"],
+            ),
+            "## 高讨论笔记 Top 10",
+            "",
+            md_table(
+                metrics.get("top_discussed_notes", [])[:10],
+                ["title", "author", "keyword", "comment_count_num", "like_count_num", "collect_count_num", "link"],
+                ["标题", "作者", "关键词", "评论", "点赞", "收藏", "链接"],
             ),
             "## 热门关键词",
             "",
@@ -185,8 +221,8 @@ def main() -> int:
             "",
             md_table(
                 metrics.get("top_topics", [])[:10],
-                ["topic_name", "note_count", "avg_likes", "p90_likes", "high_like_rate", "representative_titles"],
-                ["主题", "样本数", "平均点赞", "P90点赞", "高赞率", "代表标题"],
+                ["topic_name", "note_count", "avg_likes", "p90_likes", "high_like_rate", "collect_like_ratio", "comment_like_ratio", "representative_titles"],
+                ["主题", "样本数", "平均点赞", "P90点赞", "高赞率", "收藏/赞", "评论/赞", "代表标题"],
             ),
             "## 高频标题词",
             "",
@@ -217,22 +253,22 @@ def main() -> int:
         if not llm_result.get("enabled"):
             lines.append(f"未启用大模型分析。{llm_result.get('error', '')}".strip())
         else:
-            lines.extend(["### 关键结论", ""])
-            lines.extend(md_list(llm_result.get("summary", [])))
-            lines.extend(["", "### 主题洞察", ""])
-            lines.extend(md_list(llm_result.get("topic_insights", [])))
-            lines.extend(["", "### 案例分析", ""])
-            lines.extend(md_list(llm_result.get("case_analysis", [])))
-            lines.extend(["", "### 可复用模式", ""])
-            lines.extend(md_list(llm_result.get("pattern_library", [])))
-            lines.extend(["", "### 关键词建议", ""])
-            lines.extend(md_list(llm_result.get("keyword_suggestions", [])))
-            lines.extend(["", "### 内容建议", ""])
-            lines.extend(md_list(llm_result.get("content_suggestions", [])))
-            lines.extend(["", "### 风险提示", ""])
-            lines.extend(md_list(llm_result.get("risk_notes", [])))
-            lines.extend(["", "### 下一步动作", ""])
-            lines.extend(md_list(llm_result.get("next_actions", [])))
+            lines.extend(["### 趋势总览", ""])
+            lines.extend(md_list(llm_result.get("trend_overview", [])))
+            lines.extend(["", "### 热点信号", ""])
+            lines.extend(md_list(llm_result.get("hotspot_signals", [])))
+            lines.extend(["", "### 主题动能", ""])
+            lines.extend(md_list(llm_result.get("topic_momentum", [])))
+            lines.extend(["", "### 内容结构模式", ""])
+            lines.extend(md_list(llm_result.get("content_patterns", [])))
+            lines.extend(["", "### 证据样本", ""])
+            lines.extend(md_list(llm_result.get("evidence_cases", [])))
+            lines.extend(["", "### 异常与风险", ""])
+            lines.extend(md_list(llm_result.get("anomaly_risks", [])))
+            lines.extend(["", "### 下一步验证计划", ""])
+            lines.extend(md_list(llm_result.get("validation_plan", [])))
+            lines.extend(["", "### 可选内容方向（低优先级）", ""])
+            lines.extend(md_list(llm_result.get("low_priority_content_ideas", [])))
         report_path.write_text("\n".join(lines), encoding="utf-8")
     except Exception as exc:
         print(f"报告生成失败：{exc}", file=sys.stderr)

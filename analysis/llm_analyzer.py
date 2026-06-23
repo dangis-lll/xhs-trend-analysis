@@ -144,115 +144,138 @@ def analyze_with_llm(
     if not llm_enabled():
         return {
             "enabled": False,
-            "summary": [],
-            "topic_insights": [],
-            "case_analysis": [],
-            "pattern_library": [],
-            "keyword_suggestions": [],
-            "content_suggestions": [],
-            "risk_notes": [],
-            "next_actions": [],
+            "trend_overview": [],
+            "hotspot_signals": [],
+            "topic_momentum": [],
+            "content_patterns": [],
+            "evidence_cases": [],
+            "anomaly_risks": [],
+            "validation_plan": [],
+            "low_priority_content_ideas": [],
         }
 
     payload = {
         "metrics": metrics,
         "top_notes": top_notes[:20],
+        "top_collected_notes": metrics.get("top_collected_notes", [])[:10],
+        "top_discussed_notes": metrics.get("top_discussed_notes", [])[:10],
         "terms": terms[:30],
         "trends": (trends or [])[:30],
+        "data_scope": {
+            "source": "小红书搜索结果页",
+            "search_page_only": True,
+            "allowed_fields": [
+                "标题",
+                "作者",
+                "关键词",
+                "搜索排名",
+                "点赞/收藏/评论/分享数",
+                "图文或视频类型",
+                "封面图片地址和尺寸",
+                "搜索卡片可见文本",
+            ],
+            "forbidden_assumptions": [
+                "不要分析详情页正文、评论内容、话题标签、IP 属地、完整图片列表",
+                "不要说用户评论区具体在讨论什么，除非输入数据里有评论文本",
+                "不要把搜索页排名等同于全站热度，只能作为搜索样本信号",
+            ],
+        },
         "analysis_framework": {
-            "describe_before_explain": "先描述数据看到了什么，再解释可能原因，不把单条爆款直接等同于稳定趋势",
-            "signal_types": [
-                "平台侧信号：关键词样本量、点赞分布、高赞率、近期发布占比、重复标题句式",
-                "内容侧信号：标题钩子、清单/避坑/测评/观点/故事等结构",
-                "需求侧信号：用户想省钱、避坑、比较、决策、获得情绪共鸣",
-                "风险侧信号：样本不足、近期占比低、单个事件带偏、标题党或争议过高",
+            "logic_order": [
+                "先判断数据质量和样本边界",
+                "再识别趋势方向：升温、降温、稳定、弱信号",
+                "再解释热点由什么信号支撑：样本量、近期占比、高赞率、收藏/点赞比、评论/点赞比、重复标题词",
+                "最后给验证动作；选题建议只作为附属产物，不要喧宾夺主",
             ],
-            "case_dimensions": [
-                "标题钩子",
-                "场景/人群",
-                "内容结构",
-                "互动机制",
-                "可复用点",
-                "不可复用或需谨慎处",
+            "trend_signal_types": [
+                "volume_signal：样本数、关键词覆盖、主题样本量",
+                "engagement_signal：点赞分布、高赞率、P90、收藏/点赞、评论/点赞、分享/点赞",
+                "freshness_signal：近 N 天发布占比、近 3 天上升词",
+                "structure_signal：反复出现的标题句式、内容类型、图文/视频比例",
+                "risk_signal：样本不足、发布时间缺失、单条爆款带偏、搜索页不可见字段缺失",
             ],
-            "topic_output_rule": "不要只说热，要说明为什么热、证据是什么、下一步怎么验证",
+            "classification_rules": [
+                "趋势：至少需要多个样本、主题聚合或历史上升词支撑",
+                "热点：可以由少数高互动样本触发，但必须标注事件型/结构型/需求型/弱信号",
+                "内容模式：只分析标题、卡片和互动指标能支持的结构，不分析正文细节",
+                "选题建议：数量少于趋势/热点结论，且放在 low_priority_content_ideas",
+            ],
         },
         "requirements": [
             "只基于输入数据做分析，不要编造不存在的指标",
-            "每条结论必须引用样本标题、关键词或指标数字作为证据",
-            "不要把单条高赞事件直接当成长期趋势，必须标注是事件型/结构型/需求型信号",
-            "如果数据不足或近期样本少，要明确写出置信度和限制",
-            "输出 JSON，字段包括 summary、topic_insights、case_analysis、pattern_library、keyword_suggestions、content_suggestions、risk_notes、next_actions",
-            "summary、topic_insights、case_analysis、pattern_library、keyword_suggestions、content_suggestions、risk_notes、next_actions 必须都是数组，不要返回单个字符串",
-            "数组元素必须使用对象，例如 {\"conclusion\":\"...\", \"evidence\":\"...\", \"confidence\":\"high/medium/low\"}",
-            "case_analysis 需要分析突出帖子为什么值得关注",
-            "content_suggestions 必须包含可执行标题方向、内容结构、互动钩子和风险提示",
-            "keyword_suggestions 必须说明新增关键词的维度和验证目标",
+            "每条结论必须引用样本标题、关键词、主题指标或具体数字作为 evidence",
+            "不要把单条高赞事件直接当成长期趋势，必须标注 signal_type 和 confidence",
+            "优先输出趋势、热点、主题动能和验证计划；降低选题建议占比",
+            "如果样本不足、发布时间缺失或搜索页字段不完整，要写入 anomaly_risks",
+            "输出 JSON，字段必须包括 trend_overview、hotspot_signals、topic_momentum、content_patterns、evidence_cases、anomaly_risks、validation_plan、low_priority_content_ideas",
+            "所有字段必须都是数组；数组元素必须是对象，不要返回单个字符串",
         ],
         "output_schema": {
-            "summary": [
+            "trend_overview": [
                 {
-                    "conclusion": "一句关键结论",
-                    "evidence": "对应指标或样本标题",
+                    "trend": "趋势名称",
+                    "direction": "rising/stable/cooling/uncertain",
+                    "why": "为什么这样判断",
+                    "evidence": "指标数字或历史上升词",
                     "confidence": "high/medium/low",
                 }
             ],
-            "topic_insights": [
+            "hotspot_signals": [
                 {
-                    "topic": "主题或关键词",
-                    "insight": "洞察",
-                    "evidence": "样本数/高赞率/代表标题",
+                    "hotspot": "热点或强信号",
                     "signal_type": "event/structure/need/seasonal/weak_signal",
-                    "next_validation": "下一步如何验证",
+                    "trigger": "由什么触发关注",
+                    "evidence": "样本标题/关键词/互动指标",
+                    "confidence": "high/medium/low",
                 }
             ],
-            "case_analysis": [
+            "topic_momentum": [
                 {
-                    "title": "样本标题",
-                    "why_it_matters": "为什么突出",
-                    "hook": "标题或封面钩子",
-                    "reusable_pattern": "可复用模式",
-                    "risk_note": "风险或不适合复用处",
+                    "topic": "主题名",
+                    "momentum": "strong/medium/weak",
+                    "drivers": "样本量、高赞率、近期占比、收藏/评论比等驱动",
+                    "evidence": "主题指标或代表标题",
+                    "next_validation": "下一步验证方式",
                 }
             ],
-            "pattern_library": [
+            "content_patterns": [
                 {
                     "pattern": "可复用模式名",
-                    "fit_conditions": "适用条件",
+                    "observed_in": "哪些标题或关键词体现",
+                    "signal_value": "它代表收藏型/评论型/点击型/搜索型中的哪类",
                     "evidence": "证据标题或数据",
-                    "template": "可复用标题/内容骨架",
+                    "risk_note": "过度复用风险",
                 }
             ],
-            "keyword_suggestions": [
+            "evidence_cases": [
                 {
-                    "keyword": "建议新增关键词",
-                    "dimension": "场景/痛点/产品/内容形式/竞品/季节",
-                    "reason": "为什么纳入",
-                    "tracking_goal": "每天观察什么",
-                    "priority": "high/medium/low",
+                    "title": "样本标题",
+                    "case_type": "high_like/high_collect/high_comment/recent_rising",
+                    "why_it_matters": "为什么是证据样本",
+                    "metrics": "点赞/收藏/评论/关键词等",
                 }
             ],
-            "content_suggestions": [
+            "anomaly_risks": [
                 {
-                    "title_direction": "标题方向",
-                    "structure": "三段式结构",
-                    "interaction_hook": "评论区互动问题",
-                    "evidence": "来自哪个指标或样本",
-                    "risk_note": "风险",
-                }
-            ],
-            "risk_notes": [
-                {
-                    "risk": "风险",
+                    "risk": "风险或异常",
+                    "impact": "会怎样影响趋势判断",
                     "evidence": "证据",
-                    "mitigation": "规避方式",
+                    "mitigation": "如何规避或补采",
                 }
             ],
-            "next_actions": [
+            "validation_plan": [
                 {
-                    "action": "下一步动作",
-                    "why": "原因",
-                    "expected_output": "产出",
+                    "action": "验证动作",
+                    "why": "为什么优先做",
+                    "expected_signal": "预期看到什么信号",
+                }
+            ],
+            "low_priority_content_ideas": [
+                {
+                    "idea": "少量选题或内容方向",
+                    "based_on_signal": "基于哪个趋势或热点",
+                    "priority": "medium/low",
+                    "risk_note": "风险",
                 }
             ],
         },
@@ -262,7 +285,7 @@ def analyze_with_llm(
             [
                 {
                     "role": "system",
-                    "content": "你是小红书趋势分析师和内容运营策略师。你擅长把平台数据拆成趋势信号、用户需求、可复用内容模式和下一步动作。必须输出严格 JSON，不要输出 Markdown。",
+                    "content": "你是小红书搜索页趋势雷达分析师。你优先判断趋势、热点、信号强弱、证据链和验证计划；选题建议只放在次要位置。你只能基于搜索结果页可得字段分析，必须输出严格 JSON，不要输出 Markdown。",
                 },
                 {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
             ],
@@ -275,14 +298,14 @@ def analyze_with_llm(
         return {
             "enabled": False,
             "error": str(exc),
-            "summary": [],
-            "topic_insights": [],
-            "case_analysis": [],
-            "pattern_library": [],
-            "keyword_suggestions": [],
-            "content_suggestions": [],
-            "risk_notes": [],
-            "next_actions": [],
+            "trend_overview": [],
+            "hotspot_signals": [],
+            "topic_momentum": [],
+            "content_patterns": [],
+            "evidence_cases": [],
+            "anomaly_risks": [],
+            "validation_plan": [],
+            "low_priority_content_ideas": [],
         }
 
 

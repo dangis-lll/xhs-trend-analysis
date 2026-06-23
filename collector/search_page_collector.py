@@ -33,11 +33,22 @@ class NoteItem:
     publish_date: str = ""
     link: str = ""
     note_id: str = ""
+    xsec_token: str = ""
+    model_type: str = ""
+    note_type: str = ""
+    author_id: str = ""
+    author_avatar: str = ""
     cover_url: str = ""
+    cover_width: int = 0
+    cover_height: int = 0
+    cover_file_id: str = ""
     like_count: str = ""
     collect_count: str = ""
     comment_count: str = ""
+    share_count: str = ""
     interaction_count: str = ""
+    is_video: bool = False
+    video_duration: int = 0
     data_attrs: str = ""
     visible_text: str = ""
     extract_method: str = "search_page_card"
@@ -149,6 +160,107 @@ def dedupe_notes(items: list[NoteItem]) -> list[NoteItem]:
     return unique
 
 
+def first_image_url(cover: dict[str, Any]) -> str:
+    for key in ["url", "urlDefault", "urlPre"]:
+        value = normalize_space(cover.get(key))
+        if value:
+            return value
+    for info in cover.get("infoList") or []:
+        if isinstance(info, dict):
+            value = normalize_space(info.get("url"))
+            if value:
+                return value
+    return ""
+
+
+def note_link(note_id: str, xsec_token: str = "") -> str:
+    if not note_id:
+        return ""
+    link = f"{XHS_HOME}/explore/{note_id}"
+    if xsec_token:
+        link = f"{link}?xsec_token={quote(xsec_token)}&xsec_source=pc_search"
+    return link
+
+
+async def extract_notes_from_initial_state(page: Any, keyword: str) -> list[NoteItem]:
+    raw_items = await page.evaluate(
+        """
+        () => {
+          const feeds =
+            window.__INITIAL_STATE__?.search?.feeds?.value ??
+            window.__INITIAL_STATE__?.search?.feeds?._value ??
+            [];
+          return Array.isArray(feeds) ? feeds : [];
+        }
+        """
+    )
+
+    items: list[NoteItem] = []
+    for index, raw in enumerate(raw_items or []):
+        if not isinstance(raw, dict):
+            continue
+        card = raw.get("noteCard") or {}
+        user = card.get("user") or {}
+        interact = card.get("interactInfo") or {}
+        cover = card.get("cover") or {}
+        video = card.get("video") or {}
+        capa = video.get("capa") or {} if isinstance(video, dict) else {}
+
+        note_id = normalize_space(raw.get("id"))
+        xsec_token = normalize_space(raw.get("xsecToken"))
+        title = normalize_space(card.get("displayTitle"))
+        author = normalize_space(user.get("nickname") or user.get("nickName"))
+        like_count = normalize_space(interact.get("likedCount"))
+        collect_count = normalize_space(interact.get("collectedCount"))
+        comment_count = normalize_space(interact.get("commentCount"))
+        share_count = normalize_space(interact.get("sharedCount"))
+        visible_parts = [
+            title,
+            author,
+            f"点赞 {like_count}" if like_count else "",
+            f"收藏 {collect_count}" if collect_count else "",
+            f"评论 {comment_count}" if comment_count else "",
+            f"分享 {share_count}" if share_count else "",
+        ]
+
+        items.append(
+            NoteItem(
+                keyword=keyword,
+                rank=int(raw.get("index") if raw.get("index") is not None else index) + 1,
+                title=title,
+                author=author,
+                link=note_link(note_id, xsec_token),
+                note_id=note_id,
+                xsec_token=xsec_token,
+                model_type=normalize_space(raw.get("modelType")),
+                note_type=normalize_space(card.get("type")),
+                author_id=normalize_space(user.get("userId")),
+                author_avatar=normalize_space(user.get("avatar")),
+                cover_url=first_image_url(cover),
+                cover_width=int(cover.get("width") or 0),
+                cover_height=int(cover.get("height") or 0),
+                cover_file_id=normalize_space(cover.get("fileId")),
+                like_count=like_count,
+                collect_count=collect_count,
+                comment_count=comment_count,
+                share_count=share_count,
+                interaction_count=like_count or collect_count or comment_count or share_count,
+                is_video=bool(video),
+                video_duration=int(capa.get("duration") or 0),
+                data_attrs=json.dumps(
+                    {
+                        "source": "window.__INITIAL_STATE__.search.feeds",
+                        "raw_index": raw.get("index"),
+                    },
+                    ensure_ascii=False,
+                ),
+                visible_text=normalize_space(" ".join(part for part in visible_parts if part)),
+                extract_method="search_initial_state",
+            )
+        )
+    return dedupe_notes(items)
+
+
 def enrich_items(
     items: list[NoteItem],
     *,
@@ -178,6 +290,7 @@ def enrich_items(
 
 
 async def extract_notes_from_page(page: Any, keyword: str) -> list[NoteItem]:
+    initial_state_items = await extract_notes_from_initial_state(page, keyword)
     raw_items = await page.evaluate(
         """
         () => {
@@ -360,7 +473,7 @@ async def extract_notes_from_page(page: Any, keyword: str) -> list[NoteItem]:
                 visible_text=visible_text,
             )
         )
-    return dedupe_notes(items)
+    return dedupe_notes([*initial_state_items, *items])
 
 
 async def maybe_accept_manual_login(page: Any, login_timeout: int) -> None:
@@ -472,11 +585,22 @@ def save_outputs(items: list[NoteItem], output: Path) -> None:
             "publish_date",
             "link",
             "note_id",
+            "xsec_token",
+            "model_type",
+            "note_type",
+            "author_id",
+            "author_avatar",
             "cover_url",
+            "cover_width",
+            "cover_height",
+            "cover_file_id",
             "like_count",
             "collect_count",
             "comment_count",
+            "share_count",
             "interaction_count",
+            "is_video",
+            "video_duration",
             "data_attrs",
             "visible_text",
             "extract_method",

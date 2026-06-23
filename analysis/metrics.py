@@ -88,13 +88,22 @@ def recent_publish_mask(df: pd.DataFrame, date_str: str, days: int = 7) -> pd.Se
     end = datetime.strptime(date_str, "%Y-%m-%d").date()
     start = end - timedelta(days=days - 1)
     dates = pd.to_datetime(df["publish_date"], errors="coerce").dt.date
-    return dates.apply(lambda value: bool(value and start <= value <= end))
+    return dates.apply(lambda value: False if pd.isna(value) else start <= value <= end)
 
 
 def safe_ratio(numerator: int | float, denominator: int | float) -> float:
     if not denominator:
         return 0.0
     return round(float(numerator) / float(denominator), 4)
+
+
+def numeric_series(df: pd.DataFrame, column: str) -> pd.Series:
+    return pd.to_numeric(df.get(column, pd.Series(dtype=float)), errors="coerce")
+
+
+def sum_count(series: pd.Series) -> int:
+    values = pd.to_numeric(series, errors="coerce").dropna()
+    return int(values.sum()) if not values.empty else 0
 
 
 def compute_basic_metrics(
@@ -107,11 +116,19 @@ def compute_basic_metrics(
 ) -> dict[str, Any]:
     raw_count = len(raw_df)
     clean_count = len(clean_df)
-    like_series = pd.to_numeric(clean_df.get("like_count_num", pd.Series(dtype=float)), errors="coerce")
+    like_series = numeric_series(clean_df, "like_count_num")
+    collect_series = numeric_series(clean_df, "collect_count_num")
+    comment_series = numeric_series(clean_df, "comment_count_num")
+    share_series = numeric_series(clean_df, "share_count_num")
     valid_likes = like_series.dropna()
+    total_likes = sum_count(like_series)
+    total_collects = sum_count(collect_series)
+    total_comments = sum_count(comment_series)
+    total_shares = sum_count(share_series)
     recent_mask = recent_publish_mask(clean_df, date_str, recent_publish_days)
     publish_present = clean_df.get("publish_date", pd.Series(dtype=str)).fillna("").astype(str).ne("")
     high_like_mask = like_series.fillna(0) >= high_like_threshold
+    video_mask = clean_df.get("is_video", pd.Series([False] * clean_count, index=clean_df.index)).fillna(False).astype(bool)
 
     return {
         "date": date_str,
@@ -127,6 +144,17 @@ def compute_basic_metrics(
         "avg_likes": round(float(valid_likes.mean()), 2) if not valid_likes.empty else 0,
         "median_likes": round(float(valid_likes.median()), 2) if not valid_likes.empty else 0,
         "p90_likes": round(float(valid_likes.quantile(0.9)), 2) if not valid_likes.empty else 0,
+        "total_likes": total_likes,
+        "total_collects": total_collects,
+        "total_comments": total_comments,
+        "total_shares": total_shares,
+        "collect_like_ratio": safe_ratio(total_collects, total_likes),
+        "comment_like_ratio": safe_ratio(total_comments, total_likes),
+        "share_like_ratio": safe_ratio(total_shares, total_likes),
+        "video_count": int(video_mask.sum()),
+        "video_rate": safe_ratio(int(video_mask.sum()), clean_count),
+        "image_note_count": int(clean_count - int(video_mask.sum())),
+        "image_note_rate": safe_ratio(int(clean_count - int(video_mask.sum())), clean_count),
         "high_like_threshold": high_like_threshold,
         "high_like_count": int(high_like_mask.sum()),
         "high_like_rate": safe_ratio(int(high_like_mask.sum()), clean_count),
@@ -138,7 +166,20 @@ def top_records(df: pd.DataFrame, by: str, topn: int = 10) -> list[dict[str, Any
         return []
     cols = [
         col
-        for col in ["title", "author", "keyword", "publish_date", "like_count_num", "link", "note_id"]
+        for col in [
+            "title",
+            "author",
+            "keyword",
+            "publish_date",
+            "like_count_num",
+            "collect_count_num",
+            "comment_count_num",
+            "share_count_num",
+            "note_type",
+            "is_video",
+            "link",
+            "note_id",
+        ]
         if col in df.columns
     ]
     ranked = df.sort_values(by=by, ascending=False, na_position="last").head(topn)
@@ -162,9 +203,13 @@ def compute_topic_daily_metrics(
         "note_count",
         "new_note_count",
         "total_likes",
+        "total_collects",
+        "total_comments",
         "avg_likes",
         "median_likes",
         "p90_likes",
+        "collect_like_ratio",
+        "comment_like_ratio",
         "high_like_count",
         "high_like_rate",
         "recent_publish_ratio",
@@ -182,6 +227,8 @@ def compute_topic_daily_metrics(
     if "topic_cluster_id" not in work.columns:
         work["topic_cluster_id"] = "rule_其他"
     work["like_count_num"] = pd.to_numeric(work.get("like_count_num", 0), errors="coerce").fillna(0)
+    work["collect_count_num"] = pd.to_numeric(work.get("collect_count_num", 0), errors="coerce").fillna(0)
+    work["comment_count_num"] = pd.to_numeric(work.get("comment_count_num", 0), errors="coerce").fillna(0)
     recent_mask = recent_publish_mask(work, date_str, recent_publish_days)
     work["_recent_publish"] = recent_mask
     work["_high_like"] = work["like_count_num"] >= high_like_threshold
@@ -189,12 +236,27 @@ def compute_topic_daily_metrics(
     rows = []
     for (cluster_id, topic_name), group in work.groupby(["topic_cluster_id", "topic_name"], dropna=False):
         likes = group["like_count_num"].dropna()
+        collects = group["collect_count_num"].dropna()
+        comments = group["comment_count_num"].dropna()
         representative = group.sort_values("like_count_num", ascending=False).head(3)
         note_count = len(group)
         high_like_count = int(group["_high_like"].sum())
         recent_ratio = safe_ratio(int(group["_recent_publish"].sum()), note_count)
         p90 = round(float(likes.quantile(0.9)), 2) if not likes.empty else 0
-        topic_score = round(note_count * 1.0 + high_like_count * 3.0 + p90 / 1000.0 + recent_ratio * 2.0, 4)
+        total_likes = int(likes.sum()) if not likes.empty else 0
+        total_collects = int(collects.sum()) if not collects.empty else 0
+        total_comments = int(comments.sum()) if not comments.empty else 0
+        collect_like_ratio = safe_ratio(total_collects, total_likes)
+        comment_like_ratio = safe_ratio(total_comments, total_likes)
+        topic_score = round(
+            note_count * 1.0
+            + high_like_count * 3.0
+            + p90 / 1000.0
+            + recent_ratio * 2.0
+            + min(collect_like_ratio, 2.0)
+            + min(comment_like_ratio * 2.0, 2.0),
+            4,
+        )
         rows.append(
             {
                 "date": date_str,
@@ -203,10 +265,14 @@ def compute_topic_daily_metrics(
                 "topic_name": str(topic_name or "其他"),
                 "note_count": int(note_count),
                 "new_note_count": int(group["_recent_publish"].sum()),
-                "total_likes": int(likes.sum()) if not likes.empty else 0,
+                "total_likes": total_likes,
+                "total_collects": total_collects,
+                "total_comments": total_comments,
                 "avg_likes": round(float(likes.mean()), 2) if not likes.empty else 0,
                 "median_likes": round(float(likes.median()), 2) if not likes.empty else 0,
                 "p90_likes": p90,
+                "collect_like_ratio": collect_like_ratio,
+                "comment_like_ratio": comment_like_ratio,
                 "high_like_count": high_like_count,
                 "high_like_rate": safe_ratio(high_like_count, note_count),
                 "recent_publish_ratio": recent_ratio,

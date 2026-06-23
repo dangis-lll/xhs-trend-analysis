@@ -65,6 +65,14 @@ def main() -> int:
         metrics["top_title_terms"] = top_title_terms(clean_df, 30)
         metrics["mined_terms"] = extract_terms_from_frame(clean_df, 50)
         metrics["top_notes"] = top_records(clean_df, "like_count_num", int(config.get("top_cases") or 10))
+        metrics["top_collected_notes"] = top_records(clean_df, "collect_count_num", int(config.get("top_cases") or 10))
+        metrics["top_discussed_notes"] = top_records(clean_df, "comment_count_num", int(config.get("top_cases") or 10))
+        metrics["extract_methods"] = (
+            clean_df.get("extract_method", pd.Series(dtype=str)).fillna("").astype(str).value_counts().to_dict()
+        )
+        metrics["note_type_distribution"] = (
+            clean_df.get("note_type", pd.Series(dtype=str)).fillna("").astype(str).replace("", "unknown").value_counts().to_dict()
+        )
         topic_metrics = compute_topic_daily_metrics(
             clean_df,
             date_str=date_str,

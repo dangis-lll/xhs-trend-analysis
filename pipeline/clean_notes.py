@@ -12,6 +12,11 @@ from analysis.topic_cluster import assign_rule_topics, semantic_dedupe_placehold
 from storage.paths import ensure_dirs, normalize_date, processed_dir, raw_dir
 
 
+def parse_bool(value) -> bool:
+    text = str(value).strip().lower()
+    return text in {"1", "true", "yes", "y", "是", "视频"}
+
+
 def load_raw(date_str: str, project_id: str) -> pd.DataFrame:
     path = raw_dir(date_str, project_id) / "all_raw.xlsx"
     if not path.exists():
@@ -26,11 +31,34 @@ def clean_dataframe(raw_df: pd.DataFrame, domain_id: str | None = None) -> pd.Da
     if df.empty:
         return df
 
-    df["like_count_num"] = df.get("like_count", pd.Series(dtype=object)).apply(parse_count)
-    for col in ["title", "author", "link", "note_id", "keyword", "publish_date", "visible_text"]:
+    for source_col, num_col in [
+        ("like_count", "like_count_num"),
+        ("collect_count", "collect_count_num"),
+        ("comment_count", "comment_count_num"),
+        ("share_count", "share_count_num"),
+    ]:
+        df[num_col] = df.get(source_col, pd.Series(dtype=object)).apply(parse_count)
+
+    for col in [
+        "title",
+        "author",
+        "link",
+        "note_id",
+        "xsec_token",
+        "model_type",
+        "note_type",
+        "author_id",
+        "keyword",
+        "publish_date",
+        "visible_text",
+        "extract_method",
+    ]:
         if col not in df.columns:
             df[col] = ""
         df[col] = df[col].fillna("").astype(str).str.strip()
+    if "is_video" not in df.columns:
+        df["is_video"] = False
+    df["is_video"] = df["is_video"].fillna(False).apply(parse_bool)
 
     df = hard_dedupe(df)
     df["canonical_id"] = df["hard_duplicate_key"]

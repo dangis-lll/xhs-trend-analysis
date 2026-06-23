@@ -1,14 +1,50 @@
 from __future__ import annotations
 
+import asyncio
 import unittest
 from datetime import datetime
 
 import pandas as pd
 
 from analysis.dedupe import build_hard_duplicate_key, hard_dedupe
-from analysis.metrics import parse_count, tokenize_chinese_text
-from collector.search_page_collector import normalize_publish_date
+from analysis.metrics import compute_basic_metrics, parse_count, recent_publish_mask, tokenize_chinese_text
+from collector.search_page_collector import extract_notes_from_initial_state, normalize_publish_date
+from pipeline.clean_notes import clean_dataframe
 from pipeline.generate_report import md_list
+
+
+class FakeInitialStatePage:
+    async def evaluate(self, _script: str):
+        return [
+            {
+                "id": "abc123",
+                "xsecToken": "tok",
+                "modelType": "note",
+                "index": 0,
+                "noteCard": {
+                    "type": "normal",
+                    "displayTitle": "新手露营装备清单",
+                    "user": {
+                        "userId": "u1",
+                        "nickname": "露营研究员",
+                        "avatar": "https://example.com/avatar.jpg",
+                    },
+                    "interactInfo": {
+                        "likedCount": "1.2万",
+                        "collectedCount": "8000",
+                        "commentCount": "321",
+                        "sharedCount": "88",
+                    },
+                    "cover": {
+                        "width": 1080,
+                        "height": 1440,
+                        "urlDefault": "https://example.com/cover.jpg",
+                        "fileId": "cover-id",
+                    },
+                    "video": None,
+                },
+            }
+        ]
 
 
 class MetricsTests(unittest.TestCase):
@@ -24,6 +60,62 @@ class MetricsTests(unittest.TestCase):
         self.assertIn("有哪些好用建议", tokens)
         self.assertNotIn("5324", tokens)
         self.assertNotIn("nan", tokens)
+
+    def test_basic_metrics_include_trend_ratios(self) -> None:
+        df = pd.DataFrame(
+            [
+                {
+                    "like_count_num": 100,
+                    "collect_count_num": 50,
+                    "comment_count_num": 10,
+                    "share_count_num": 5,
+                    "publish_date": "2026-06-22",
+                    "is_video": True,
+                },
+                {
+                    "like_count_num": 300,
+                    "collect_count_num": 150,
+                    "comment_count_num": 30,
+                    "share_count_num": 15,
+                    "publish_date": "2026-06-20",
+                    "is_video": False,
+                },
+            ]
+        )
+        metrics = compute_basic_metrics(
+            df,
+            df,
+            date_str="2026-06-22",
+            high_like_threshold=200,
+            recent_publish_days=7,
+        )
+        self.assertEqual(metrics["total_likes"], 400)
+        self.assertEqual(metrics["collect_like_ratio"], 0.5)
+        self.assertEqual(metrics["comment_like_ratio"], 0.1)
+        self.assertEqual(metrics["share_like_ratio"], 0.05)
+        self.assertEqual(metrics["video_rate"], 0.5)
+
+    def test_recent_publish_mask_handles_missing_dates(self) -> None:
+        df = pd.DataFrame({"publish_date": ["2026-06-22", "", None, "not-a-date"]})
+        mask = recent_publish_mask(df, "2026-06-22", 7)
+        self.assertEqual(mask.tolist(), [True, False, False, False])
+
+
+class CollectorTests(unittest.TestCase):
+    def test_extract_notes_from_initial_state(self) -> None:
+        items = asyncio.run(extract_notes_from_initial_state(FakeInitialStatePage(), "露营装备"))
+        self.assertEqual(len(items), 1)
+        item = items[0]
+        self.assertEqual(item.note_id, "abc123")
+        self.assertEqual(item.xsec_token, "tok")
+        self.assertEqual(item.title, "新手露营装备清单")
+        self.assertEqual(item.author_id, "u1")
+        self.assertEqual(item.like_count, "1.2万")
+        self.assertEqual(item.collect_count, "8000")
+        self.assertEqual(item.comment_count, "321")
+        self.assertEqual(item.share_count, "88")
+        self.assertEqual(item.cover_width, 1080)
+        self.assertFalse(item.is_video)
 
 
 class DedupeTests(unittest.TestCase):
@@ -41,6 +133,28 @@ class DedupeTests(unittest.TestCase):
         out = hard_dedupe(df)
         self.assertEqual(len(out), 1)
         self.assertEqual(out.iloc[0]["title"], "高赞")
+
+    def test_clean_dataframe_normalizes_video_bool_strings(self) -> None:
+        df = pd.DataFrame(
+            [
+                {
+                    "note_id": "a",
+                    "title": "图文",
+                    "like_count": "10",
+                    "rank": 1,
+                    "is_video": "False",
+                },
+                {
+                    "note_id": "b",
+                    "title": "视频",
+                    "like_count": "20",
+                    "rank": 2,
+                    "is_video": "True",
+                },
+            ]
+        )
+        out = clean_dataframe(df)
+        self.assertEqual(out["is_video"].tolist(), [False, True])
 
 
 class TimeParseTests(unittest.TestCase):
