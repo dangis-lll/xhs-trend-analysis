@@ -5,6 +5,7 @@ from typing import Any
 
 import pandas as pd
 
+from analysis.authors import build_top_author_records
 from analysis.entity_miner import mine_demand_signals, mine_entity_candidates
 from analysis.metrics import numeric_series, safe_ratio, tokenize_chinese_text
 from analysis.rule_loader import load_content_pattern_rules, load_entity_rules
@@ -140,9 +141,6 @@ def compute_search_page_signals(
     for title in work.get("title", pd.Series(dtype=str)).fillna("").astype(str):
         title_counter.update(tokenize_chinese_text(title))
 
-    author_counter = Counter(
-        work.get("author", pd.Series(dtype=str)).fillna("").astype(str).str.strip().replace("", pd.NA).dropna().tolist()
-    )
     keyword_counter = Counter(
         work.get("keyword", pd.Series(dtype=str)).fillna("").astype(str).str.strip().replace("", pd.NA).dropna().tolist()
     )
@@ -163,7 +161,7 @@ def compute_search_page_signals(
         "entity_candidates": mine_entity_candidates(work, entity_rules=active_entity_rules),
         "demand_signals": mine_demand_signals(work),
         "top_title_terms": _top_counter(title_counter),
-        "top_authors": _top_counter(author_counter),
+        "top_authors": build_top_author_records(work),
         "top_keywords": _top_counter(keyword_counter),
         "interaction_overview": {
             "total_likes": int(like_series.sum()),

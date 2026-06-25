@@ -64,7 +64,6 @@ def clean_dataframe(
     if "is_video" not in df.columns:
         df["is_video"] = False
     df["is_video"] = df["is_video"].fillna(False).apply(parse_bool)
-
     df = hard_dedupe(df)
     df["canonical_id"] = df["hard_duplicate_key"]
     df["quality_score"] = 100
@@ -75,6 +74,8 @@ def clean_dataframe(
     df = add_image_analysis_placeholders(df)
     df = assign_rule_topics(df, topic_rules=topic_rules)
     df = semantic_dedupe_placeholder(df)
+    if "publish_time" in df.columns:
+        df = df.drop(columns=["publish_time"])
     return df.reset_index(drop=True)
 
 

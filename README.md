@@ -12,7 +12,7 @@
 - 采集搜索页结构化数据和卡片可见信息，包括标题、作者、链接、封面、点赞、收藏、评论、分享、图文/视频类型等。
 - 清洗、硬去重、标准化互动数字和发布时间。
 - 计算趋势指标：高赞率、近期发布占比、收藏/点赞比、评论/点赞比、视频占比、主题动能、近 3 天上升词等。
-- 生成趋势日报和市场局势报告，重点输出搜索页局势、主题、内容打法、作者和证据。
+- 生成市场局势主报告，重点输出搜索页局势、主题、内容打法、作者和证据。
 - 按领域隔离长期记忆，维护 `current_state`、wiki、daily summary、rollup、趋势表和实体索引。
 - 用 `evidence_id` 约束重要判断，降低 LLM 直接分析原始表导致的幻觉。
 - 支持数据质量降级、连续失败熔断、规则候选、人工纠错、可选详情页抽样目标和轻量知识库更新。
@@ -52,8 +52,8 @@ python xhs_trend_app.py
 - 编辑调研说明和关键词池
 - 设置每日关键词数、每词采集数、每日总上限、登录等待时间
 - 调用 DeepSeek 扩展关键词
-- 一键运行采集、清洗、封面分析、指标计算、历史合并、日报生成
-- 查看日报、市场报告、证据、记忆、wiki、规则候选、人工纠错文件和长期趋势表
+- 一键运行采集、清洗、指标计算、历史合并、市场报告生成
+- 查看主报告、证据、记忆、wiki、规则候选、人工纠错文件和长期趋势表
 
 DeepSeek API Key 不会保存到项目文件。可以在界面输入，也可以设置环境变量：
 
@@ -84,7 +84,6 @@ python xhs_trend_app.py
 python -m pipeline.run_daily --domain camping --date today
 python -m pipeline.clean_notes --domain camping --date today
 python -m pipeline.apply_manual_corrections --domain camping --date today
-python -m pipeline.analyze_images --domain camping --date today
 python -m pipeline.compute_metrics --domain camping --date today
 python -m pipeline.compute_search_page_signals --domain camping --date today
 python -m pipeline.evaluate_rules --domain camping --date today
@@ -95,7 +94,6 @@ python -m pipeline.merge_history_clean --domain camping --date today --days 30
 python -m pipeline.generate_market_report --domain camping --date today
 python -m pipeline.update_memory --domain camping --date today
 python -m pipeline.update_rollups --domain camping --date today
-python -m pipeline.generate_report --domain camping --date today
 ```
 
 可选步骤：
@@ -148,7 +146,6 @@ projects/<domain>/
   processed/                # 清洗数据、指标、候选关键词
   details/YYYY-MM-DD/       # 可选详情页抽样目标和人工补录模板
   images/YYYY-MM-DD/        # 可选封面图
-  reports/daily/            # Markdown 日报
   reports/market/           # 市场局势报告
   memory/                   # 分层记忆、证据、趋势表、实体索引、wiki
   knowledge-base/           # 轻量关键词池和运行记录
@@ -177,4 +174,4 @@ projects/<domain>/
 - IP 属地
 - 完整图片列表
 
-日报中的趋势和热点判断只基于搜索页可见字段和历史快照。小红书页面结构和风控策略可能变化，如果字段缺失，可根据原始数据里的 `visible_text`、`extract_method` 和页面结构调整采集逻辑。
+报告中的趋势和热点判断只基于搜索页可见字段和历史快照。小红书页面结构和风控策略可能变化，如果字段缺失，可根据原始数据里的 `visible_text`、`extract_method` 和页面结构调整采集逻辑。

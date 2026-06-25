@@ -38,10 +38,6 @@ def processed_dir(project_id: str = "manual") -> Path:
     return project_dir(project_id) / "processed"
 
 
-def report_dir(date: str | None = None, project_id: str = "manual") -> Path:
-    return project_dir(project_id) / "reports" / "daily"
-
-
 def market_report_dir(project_id: str = "manual") -> Path:
     return project_dir(project_id) / "reports" / "market"
 
@@ -106,7 +102,6 @@ def ensure_dirs(date: str | None = None, project_id: str = "manual") -> None:
     for path in [
         raw_dir(date, project_id),
         processed_dir(project_id),
-        report_dir(date, project_id),
         market_report_dir(project_id),
         evidence_dir(project_id),
         memory_daily_dir(project_id),

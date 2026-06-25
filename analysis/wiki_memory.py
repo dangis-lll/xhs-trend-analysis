@@ -96,7 +96,7 @@ def render_index(*, domain: dict[str, Any], daily_summary: dict[str, Any], wiki_
         _line_item("Schema", "schema.md", "wiki 维护规则和边界。"),
         _line_item("Log", "log.md", "按时间追加的维护记录。"),
         _line_item("Current State", "../current_state.md", "程序压缩后的长期状态。"),
-        _line_item("Latest Daily Summary", f"../daily/{date_str}_summary.json", "最近一次结构化日摘要。"),
+        _line_item("最新日摘要", f"../daily/{date_str}_summary.json", "最近一次结构化日摘要，不是面向用户的日报。"),
     ]
     rollup_pages = sorted(wiki_dir.parent.glob("rollups/*_summary.md"))[-6:]
     for path in reversed(rollup_pages):

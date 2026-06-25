@@ -6,7 +6,6 @@ import sys
 import pandas as pd
 
 from analysis.image_analyzer import add_image_analysis_placeholders, download_cover_images
-from pipeline.common import load_analysis_config
 from storage.paths import normalize_date, processed_dir
 
 
@@ -22,15 +21,14 @@ def main() -> int:
     args = parse_args()
     date_str = normalize_date(args.date)
     path = processed_dir(args.domain) / f"{date_str}_clean_notes.xlsx"
+    if not args.download:
+        print("未启用封面图下载，跳过图片分析步骤。")
+        return 0
     try:
         if not path.exists():
             raise FileNotFoundError(f"找不到清洗结果：{path}")
         df = pd.read_excel(path)
-        config = load_analysis_config().get("analysis", {})
-        enable_ocr = bool(config.get("enable_ocr", False))
-        out = download_cover_images(df, date_str, args.domain) if args.download else add_image_analysis_placeholders(df)
-        if not enable_ocr:
-            out["cover_ocr_text"] = out.get("cover_ocr_text", "")
+        out = add_image_analysis_placeholders(download_cover_images(df, date_str, args.domain))
         out.to_excel(path, index=False)
         out.to_csv(processed_dir(args.domain) / f"{date_str}_clean_notes.csv", index=False, encoding="utf-8-sig")
     except Exception as exc:

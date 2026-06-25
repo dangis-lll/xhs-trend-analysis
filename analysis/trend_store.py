@@ -100,14 +100,19 @@ def build_author_daily_rows(daily_summary: dict[str, Any]) -> list[dict[str, Any
     rows = []
     for item in daily_summary.get("top_authors", []) or []:
         author = _clean_text(item.get("name") or item.get("author"))
-        if not author:
+        author_key = _clean_text(item.get("author_key"))
+        if not author_key:
             continue
         rows.append(
             {
                 "date": date_str,
                 "domain_id": domain_id,
+                "author_key": author_key,
                 "author": author,
+                "author_id": _clean_text(item.get("author_id")),
                 "sample_count": _int(item.get("count") or item.get("sample_count")),
+                "identity_basis": _clean_text(item.get("identity_basis")),
+                "identity_confidence": _clean_text(item.get("identity_confidence")),
                 "data_quality": _clean_text(quality.get("quality_level", "unknown")),
             }
         )
@@ -214,15 +219,20 @@ def build_author_index_rows(daily_summary: dict[str, Any]) -> list[dict[str, Any
     rows = []
     for item in daily_summary.get("top_authors", []) or []:
         author = _clean_text(item.get("name") or item.get("author"))
-        if not author:
+        author_key = _clean_text(item.get("author_key"))
+        if not author_key:
             continue
         rows.append(
             {
                 "domain_id": domain_id,
+                "author_key": author_key,
                 "author": author,
+                "author_id": _clean_text(item.get("author_id")),
                 "first_seen": date_str,
                 "last_seen": date_str,
                 "latest_sample_count": _int(item.get("count") or item.get("sample_count")),
+                "identity_basis": _clean_text(item.get("identity_basis")),
+                "identity_confidence": _clean_text(item.get("identity_confidence")),
             }
         )
     return rows
@@ -395,15 +405,17 @@ def build_trend_events(
 
     for item in (daily_summary.get("top_authors", []) or [])[:max_per_type]:
         author = _clean_text(item.get("name") or item.get("author"))
-        if author:
+        author_key = _clean_text(item.get("author_key"))
+        if author_key:
             events.append(
                 {
-                    "event_id": _event_id(date_str, domain_id, "author_observed", author),
+                    "event_id": _event_id(date_str, domain_id, "author_observed", author_key),
                     "date": date_str,
                     "domain_id": domain_id,
                     "event_type": "author_observed",
                     "subject_type": "author",
                     "subject": author,
+                    "subject_key": author_key,
                     "sample_count": _int(item.get("count") or item.get("sample_count")),
                     "verification_status": verification_status,
                     "created_at": datetime.now().isoformat(timespec="seconds"),

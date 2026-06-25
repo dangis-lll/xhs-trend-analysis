@@ -81,7 +81,13 @@ def build_rollup(
 ) -> dict[str, Any]:
     topic_counter = _counter_from_items(summaries, "top_topics", "topic")
     pattern_counter = _counter_from_items(summaries, "top_content_patterns", "content_pattern")
-    author_counter = _counter_from_items(summaries, "top_authors", "name")
+    author_counter = _counter_from_items(summaries, "top_authors", "author_key")
+    author_names: dict[str, str] = {}
+    for summary in summaries:
+        for item in summary.get("top_authors", []) or []:
+            author_key = str(item.get("author_key") or "").strip()
+            if author_key and author_key not in author_names:
+                author_names[author_key] = str(item.get("name") or item.get("author") or "").strip()
     clean_counts = [
         int(summary.get("metrics_summary", {}).get("clean_count") or 0)
         for summary in summaries
@@ -111,7 +117,10 @@ def build_rollup(
         "top_content_patterns": [
             {"content_pattern": name, "score": count} for name, count in pattern_counter.most_common(12)
         ],
-        "top_authors": [{"name": name, "score": count} for name, count in author_counter.most_common(12)],
+        "top_authors": [
+            {"author_key": key, "name": author_names.get(key, ""), "score": count}
+            for key, count in author_counter.most_common(12)
+        ],
         "representative_evidence_ids": list(dict.fromkeys(evidence_ids))[:20],
     }
 
@@ -142,8 +151,9 @@ def render_rollup_summary(rollup: dict[str, Any]) -> str:
         lines.append("- 暂无内容打法汇总。")
 
     lines.extend(["", "## 高频作者汇总", ""])
+    lines.append("作者汇总按 author_id 聚合；昵称可能重名。")
     for item in rollup.get("top_authors", [])[:10]:
-        lines.append(f"- {item.get('name', '')}: score {item.get('score', 0)}")
+        lines.append(f"- {item.get('name', '')} ({item.get('author_key', '')}): score {item.get('score', 0)}")
     if not rollup.get("top_authors"):
         lines.append("- 暂无作者汇总。")
 

@@ -17,7 +17,6 @@ DEFAULT_STEPS = [
     "run_daily",
     "clean_notes",
     "apply_manual_corrections",
-    "analyze_images",
     "compute_metrics",
     "compute_search_page_signals",
     "evaluate_rules",
@@ -28,7 +27,6 @@ DEFAULT_STEPS = [
     "generate_market_report",
     "update_memory",
     "update_rollups",
-    "generate_report",
     "update_knowledge_base",
 ]
 
@@ -125,4 +123,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

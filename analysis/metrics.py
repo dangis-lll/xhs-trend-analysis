@@ -171,6 +171,8 @@ def top_records(df: pd.DataFrame, by: str, topn: int = 10) -> list[dict[str, Any
             "author",
             "keyword",
             "publish_date",
+            "topic_name",
+            "content_pattern",
             "like_count_num",
             "collect_count_num",
             "comment_count_num",

@@ -229,8 +229,9 @@ def render_current_state(*, domain: dict[str, Any], daily_summary: dict[str, Any
         lines.append("- 暂无内容打法信号。")
 
     lines.extend(["", "## 高频作者", ""])
+    lines.append("作者集中度按 author_id 聚合；昵称可能重名，默认昵称如 momo 不作为稳定作者身份。")
     for item in authors[:8]:
-        lines.append(f"- {item.get('name', '')}: 出现 {item.get('count', 0)} 次")
+        lines.append(f"- {item.get('name', '')} ({item.get('author_key', '')}): 出现 {item.get('count', 0)} 次")
     if not authors:
         lines.append("- 暂无明显作者集中信号。")
 

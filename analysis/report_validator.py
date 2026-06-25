@@ -37,6 +37,16 @@ def collect_allowed_evidence_ids(llm_input: dict[str, Any]) -> set[str]:
     return allowed
 
 
+def collect_allowed_author_keys(llm_input: dict[str, Any]) -> set[str]:
+    allowed = set()
+    signals = llm_input.get("signals", {}) or {}
+    for item in signals.get("top_authors", []) or []:
+        author_key = item.get("author_key")
+        if author_key:
+            allowed.add(str(author_key))
+    return allowed
+
+
 def _iter_texts(value: Any) -> list[str]:
     if isinstance(value, str):
         return [value]
@@ -98,6 +108,24 @@ def _check_lengths(analysis: dict[str, Any], issues: list[dict[str, Any]], max_t
                     item[key] = value[:max_text_length].rstrip() + "..."
 
 
+def _filter_author_findings(cleaned: dict[str, Any], allowed_author_keys: set[str], issues: list[dict[str, Any]]) -> None:
+    kept = []
+    for item in _normalize_array(cleaned.get("author_findings")):
+        author_key = str(item.get("author_key") or "").strip()
+        if author_key and author_key in allowed_author_keys:
+            kept.append(item)
+            continue
+        issues.append(
+            {
+                "type": "invalid_author_identity",
+                "field": "author_findings",
+                "author": str(item.get("author") or item.get("name") or ""),
+                "author_key": author_key,
+            }
+        )
+    cleaned["author_findings"] = kept
+
+
 def validate_market_analysis(
     analysis: dict[str, Any],
     llm_input: dict[str, Any],
@@ -105,6 +133,7 @@ def validate_market_analysis(
     max_text_length: int = 500,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     allowed = collect_allowed_evidence_ids(llm_input)
+    allowed_author_keys = collect_allowed_author_keys(llm_input)
     cleaned = dict(analysis)
     issues: list[dict[str, Any]] = []
 
@@ -113,6 +142,7 @@ def validate_market_analysis(
         for item in cleaned[field]:
             _filter_evidence_ids(item, allowed, issues, field)
 
+    _filter_author_findings(cleaned, allowed_author_keys, issues)
     _check_forbidden_claims(cleaned, issues)
     _check_lengths(cleaned, issues, max_text_length)
 

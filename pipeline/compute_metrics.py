@@ -6,6 +6,7 @@ import sys
 
 import pandas as pd
 
+from analysis.authors import build_top_author_records
 from analysis.keyword_miner import extract_terms_from_frame, suggest_keywords
 from analysis.metrics import compute_basic_metrics, compute_topic_daily_metrics, top_records, top_title_terms
 from pipeline.common import domain_keywords, get_domain, load_analysis_config
@@ -59,9 +60,7 @@ def main() -> int:
         metrics["top_keywords"] = (
             clean_df.get("keyword", pd.Series(dtype=str)).fillna("").astype(str).value_counts().head(20).to_dict()
         )
-        metrics["top_authors"] = (
-            clean_df.get("author", pd.Series(dtype=str)).fillna("").astype(str).replace("", pd.NA).dropna().value_counts().head(20).to_dict()
-        )
+        metrics["top_authors"] = build_top_author_records(clean_df, 20)
         metrics["top_title_terms"] = top_title_terms(clean_df, 30)
         metrics["mined_terms"] = extract_terms_from_frame(clean_df, 50)
         metrics["top_notes"] = top_records(clean_df, "like_count_num", int(config.get("top_cases") or 10))

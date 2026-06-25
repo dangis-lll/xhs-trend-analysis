@@ -153,7 +153,7 @@ def main() -> int:
         upsert_csv(
             trends_dir / "author_daily.csv",
             build_author_daily_rows(daily_summary),
-            key_fields=["date", "domain_id", "author"],
+            key_fields=["date", "domain_id", "author_key"],
         )
         upsert_csv(
             trends_dir / "keyword_daily.csv",
@@ -180,7 +180,7 @@ def main() -> int:
         upsert_index_csv(
             entities_dir / "authors.csv",
             build_author_index_rows(daily_summary),
-            key_fields=["domain_id", "author"],
+            key_fields=["domain_id", "author_key"],
         )
         upsert_index_csv(
             entities_dir / "keywords.csv",

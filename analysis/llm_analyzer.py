@@ -315,7 +315,7 @@ def analyze_market_context_with_llm(llm_input: dict[str, Any]) -> dict[str, Any]
 
     payload = {
         "context": llm_input,
-        "task": "基于压缩后的结构化搜索页数据，分析当前市场局势。建议内容低优先级。",
+        "task": "基于压缩后的结构化搜索页数据，分析当前市场局势。如需提到后续动作，只能写成待验证方向，不写成行动建议。",
         "hard_rules": [
             "只能基于 context 中的数据分析。",
             "不得推断销量、成交、投放、全市场规模、详情页正文或评论区观点。",
@@ -351,7 +351,8 @@ def analyze_market_context_with_llm(llm_input: dict[str, Any]) -> dict[str, Any]
             "author_findings": [
                 {
                     "author": "作者名",
-                    "finding": "作者在样本中的可见度",
+                    "author_key": "xhs_user:<author_id>",
+                    "finding": "作者在样本中的可见度；只能按 author_key/author_id 判断同一作者，不能按昵称合并",
                     "confidence": "high/medium/low",
                     "evidence_ids": ["ev_xxx"],
                 }
@@ -371,7 +372,7 @@ def analyze_market_context_with_llm(llm_input: dict[str, Any]) -> dict[str, Any]
             ],
             "low_priority_suggestions": [
                 {
-                    "suggestion": "少量低优先级建议",
+                    "suggestion": "少量后续验证方向，不写成行动建议",
                     "based_on_evidence_id": "ev_xxx",
                 }
             ],

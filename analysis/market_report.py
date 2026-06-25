@@ -20,6 +20,44 @@ def _bullet(text: str) -> str:
     return f"- {text}"
 
 
+def _percent_or_dash(value: Any) -> str:
+    try:
+        return f"{float(value):.2%}"
+    except (TypeError, ValueError):
+        return "-"
+
+
+def _md_table(rows: list[dict[str, Any]], columns: list[str], headers: list[str]) -> str:
+    if not rows:
+        return "暂无数据\n"
+    lines = ["| " + " | ".join(headers) + " |", "| " + " | ".join(["---"] * len(headers)) + " |"]
+    for row in rows:
+        values = [str(row.get(col, "") or "").replace("\n", " ") for col in columns]
+        lines.append("| " + " | ".join(values) + " |")
+    return "\n".join(lines) + "\n"
+
+
+def _case_title(item: dict[str, Any]) -> str:
+    title = str(item.get("title") or "").strip()
+    return title[:60] if title else "未命名样本"
+
+
+def _case_rows(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows = []
+    for item in items:
+        rows.append(
+            {
+                "title": _case_title(item),
+                "topic": item.get("topic_name") or item.get("content_pattern") or "",
+                "likes": item.get("like_count_num") if item.get("like_count_num") is not None else "",
+                "collects": item.get("collect_count_num") if item.get("collect_count_num") is not None else "",
+                "comments": item.get("comment_count_num") if item.get("comment_count_num") is not None else "",
+                "link": item.get("link") or "",
+            }
+        )
+    return rows
+
+
 def _evidence_line(item: dict[str, Any]) -> str:
     metrics = []
     for label, key in [("赞", "like_count_num"), ("藏", "collect_count_num"), ("评", "comment_count_num")]:
@@ -79,7 +117,12 @@ def deterministic_market_analysis(llm_input: dict[str, Any]) -> dict[str, Any]:
         for item in top_patterns
     ]
     author_findings = [
-        {"author": item.get("name", ""), "finding": f"搜索页样本中出现 {item.get('count', 0)} 次。", "evidence_ids": []}
+        {
+            "author": item.get("name", ""),
+            "author_key": item.get("author_key", ""),
+            "finding": f"基于 author_id 识别为同一作者，搜索页样本中出现 {item.get('count', 0)} 次。昵称可能重名，不按昵称合并。",
+            "evidence_ids": [],
+        }
         for item in top_authors
     ]
     entity_findings = [
@@ -145,6 +188,8 @@ def render_market_report(llm_input: dict[str, Any], analysis: dict[str, Any]) ->
     meta = llm_input.get("meta", {})
     quality = llm_input.get("data_quality", {})
     metrics = llm_input.get("metrics_summary", {})
+    signals = llm_input.get("signals", {})
+    case_tables = llm_input.get("case_tables", {})
     evidence = llm_input.get("representative_evidence", [])
     lines = [
         f"# 小红书搜索页市场局势报告：{meta.get('domain_name', meta.get('domain_id', ''))}",
@@ -162,6 +207,20 @@ def render_market_report(llm_input: dict[str, Any], analysis: dict[str, Any]) ->
     ]
     for item in analysis.get("situation_summary", []) or []:
         lines.append(_bullet(str(item.get("summary") or item.get("finding") or "")))
+
+    overview_rows = [
+        {"name": "原始样本数", "value": metrics.get("raw_count", 0)},
+        {"name": "清洗后样本数", "value": metrics.get("clean_count", 0)},
+        {"name": "去重率", "value": _percent_or_dash(metrics.get("dedupe_rate"))},
+        {"name": "发布时间覆盖率", "value": _percent_or_dash(metrics.get("publish_date_present_rate"))},
+        {"name": "近几天发布样本占比", "value": _percent_or_dash(metrics.get("recent_publish_ratio"))},
+        {"name": "高赞样本数", "value": metrics.get("high_like_count", 0)},
+        {"name": "高赞率", "value": _percent_or_dash(metrics.get("high_like_rate"))},
+        {"name": "收藏/点赞比", "value": _percent_or_dash(metrics.get("collect_like_ratio"))},
+        {"name": "评论/点赞比", "value": _percent_or_dash(metrics.get("comment_like_ratio"))},
+        {"name": "视频占比", "value": _percent_or_dash(metrics.get("video_rate"))},
+    ]
+    lines.extend(["", "## 样本指标", "", _md_table(overview_rows, ["name", "value"], ["指标", "数值"]).rstrip()])
 
     lines.extend(["", "## 主题信号", ""])
     topic_items = analysis.get("topic_findings", []) or []
@@ -182,11 +241,15 @@ def render_market_report(llm_input: dict[str, Any], analysis: dict[str, Any]) ->
         lines.append("暂无足够内容打法信号。")
 
     lines.extend(["", "## 作者与样本集中度", ""])
+    lines.append("作者集中度只按 `author_id` 聚合；昵称可能重名，默认昵称如 momo 不作为稳定作者身份。")
+    lines.append("")
     author_items = analysis.get("author_findings", []) or []
     if author_items:
         for item in author_items:
             author = item.get("author") or item.get("name") or "未知作者"
-            lines.append(_bullet(f"{author}：{item.get('finding') or item.get('analysis') or ''}"))
+            author_key = item.get("author_key") or ""
+            key_text = f"（{author_key}）" if author_key else ""
+            lines.append(_bullet(f"{author}{key_text}：{item.get('finding') or item.get('analysis') or ''}"))
     else:
         lines.append("暂无明显作者集中信号。")
 
@@ -209,6 +272,30 @@ def render_market_report(llm_input: dict[str, Any], analysis: dict[str, Any]) ->
     else:
         lines.append("暂无明显需求信号。")
 
+    title_terms = signals.get("top_title_terms", []) or []
+    if title_terms:
+        term_rows = []
+        for item in title_terms[:15]:
+            term_rows.append(
+                {
+                    "term": item.get("term") or item.get("name") or "",
+                    "count": item.get("count") or item.get("value") or "",
+                }
+            )
+        lines.extend(["", "## 高频标题词", "", _md_table(term_rows, ["term", "count"], ["词", "次数"]).rstrip()])
+
+    top_liked = case_tables.get("top_liked_notes", []) or []
+    top_collected = case_tables.get("top_collected_notes", []) or []
+    top_discussed = case_tables.get("top_discussed_notes", []) or []
+    if top_liked or top_collected or top_discussed:
+        lines.extend(["", "## 高互动样本", ""])
+        if top_liked:
+            lines.extend(["### 高赞样本", "", _md_table(_case_rows(top_liked[:8]), ["title", "topic", "likes", "collects", "comments", "link"], ["标题", "主题/打法", "赞", "藏", "评", "链接"]).rstrip(), ""])
+        if top_collected:
+            lines.extend(["### 高收藏样本", "", _md_table(_case_rows(top_collected[:8]), ["title", "topic", "likes", "collects", "comments", "link"], ["标题", "主题/打法", "赞", "藏", "评", "链接"]).rstrip(), ""])
+        if top_discussed:
+            lines.extend(["### 高讨论样本", "", _md_table(_case_rows(top_discussed[:8]), ["title", "topic", "likes", "collects", "comments", "link"], ["标题", "主题/打法", "赞", "藏", "评", "链接"]).rstrip()])
+
     lines.extend(["", "## 代表证据", ""])
     if evidence:
         for item in evidence[:10]:
@@ -226,7 +313,9 @@ def render_market_report(llm_input: dict[str, Any], analysis: dict[str, Any]) ->
 
     suggestions = analysis.get("low_priority_suggestions", []) or analysis.get("low_priority_content_ideas", []) or []
     if suggestions:
-        lines.extend(["", "## 低优先级建议", ""])
+        lines.extend(["", "## AI延申观察", ""])
+        lines.append("以下内容不是市场结论，也不是行动建议，只是 AI 基于当前搜索页样本提出的延伸观察，请结合证据和后续数据判断。")
+        lines.append("")
         for item in suggestions[:3]:
             lines.append(_bullet(str(item.get("suggestion") or item.get("idea") or item)))
 

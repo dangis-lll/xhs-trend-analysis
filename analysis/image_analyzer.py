@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from pathlib import Path
 from urllib.parse import urlparse
 
 import pandas as pd
@@ -43,10 +42,6 @@ def download_cover_images(df: pd.DataFrame, date: str, project_id: str = "manual
     out["cover_image_path"] = paths
     out["quality_flags"] = flags
     return out
-
-
-def extract_ocr_text(image_path: Path) -> str:
-    return ""
 
 
 def add_image_analysis_placeholders(df: pd.DataFrame) -> pd.DataFrame:

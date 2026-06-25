@@ -5,8 +5,4 @@ analysis:
   recent_publish_days: 7
   top_topics: 10
   top_cases: 10
-  enable_ocr: false
-  enable_multimodal: false
   enable_llm_report: false
-  enable_detail_cases: false
-  max_detail_cases: 0

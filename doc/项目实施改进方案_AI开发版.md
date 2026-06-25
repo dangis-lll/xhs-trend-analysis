@@ -1088,7 +1088,7 @@ pending / running / success / skipped / failed
 
 ```text
 pipeline.run_daily
-pipeline.merge_raw
+pipeline.merge_history_clean
 pipeline.clean_notes
 pipeline.analyze_images --optional
 pipeline.compute_metrics
@@ -1104,7 +1104,7 @@ pipeline.generate_market_report
 说明：
 
 - `run_daily` 负责按关键词采集搜索页原始结果。
-- `merge_raw` 应放在清洗前或并入 `run_daily`，用于合并同日多关键词原始结果；如果保留现有“合并历史 clean 数据”的含义，应改名为 `merge_history_clean`，并放在 `compute_metrics` 之后、`generate_market_report` 之前。
+- 历史 clean 合并统一使用 `merge_history_clean`，放在 `compute_metrics` 之后、`generate_market_report` 之前；不要恢复 `merge_raw` 旧别名。
 - `clean_notes` 依赖采集/合并后的原始数据。
 - `analyze_images` 目前是可选增强，只能补充封面图/OCR/视觉模式字段；失败不应阻塞主流程。
 - `compute_metrics` 依赖清洗后的数据。
@@ -1335,7 +1335,7 @@ AI 开发者可能把“测评/避坑/清单”写入 `topic_daily.csv`，导致
 0. 新增全局前置配置：`memory_global/analysis_rules.md`、`wiki_schema.md`、`report_schema.yaml`、topic/content_pattern 词表。
 1. 新增领域记忆目录创建逻辑，包括 `memory/wiki/index.md`、`log.md`、`schema.md`。
 2. 新增统一 `evidence_id` 生成器和 `generate_evidence` 模块。
-3. 修正 pipeline 顺序，明确 `merge_raw` 的含义；如表示历史合并则改名为 `merge_history_clean`。
+3. 修正 pipeline 顺序，历史合并统一使用 `merge_history_clean`。
 4. 新增 `data_quality.json` 和降级策略。
 5. 新增标题内容模式识别，使用规则，不默认调用 LLM。
 6. 明确 topic 规则聚类，和 content_pattern 分表保存。

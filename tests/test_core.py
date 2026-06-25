@@ -8,6 +8,7 @@ from datetime import datetime
 
 import pandas as pd
 
+from analysis.authors import build_top_author_records
 from analysis.dedupe import build_hard_duplicate_key, hard_dedupe
 from analysis.data_quality import evaluate_quality
 from analysis.detail_sampling import (
@@ -66,9 +67,14 @@ from analysis.trend_store import (
 )
 from analysis.wiki_memory import update_wiki_files
 from pipeline.update_rollups import build_and_write_period
-from collector.search_page_collector import extract_notes_from_initial_state, normalize_publish_date
+from collector.search_page_collector import (
+    NoteItem,
+    dedupe_notes,
+    extract_notes_from_initial_state,
+    normalize_publish_date,
+    note_item_to_row,
+)
 from pipeline.clean_notes import clean_dataframe
-from pipeline.generate_report import md_list
 from pipeline.install_windows_task import build_schtasks_command, build_task_run_command
 from pipeline.merge_history_clean import date_range
 from pipeline.run_scheduled import is_due
@@ -178,6 +184,37 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(item.cover_width, 1080)
         self.assertFalse(item.is_video)
 
+    def test_dedupe_notes_merges_dom_publish_date(self) -> None:
+        items = dedupe_notes(
+            [
+                NoteItem(
+                    keyword="露营装备",
+                    note_id="abc123",
+                    title="新手露营装备清单",
+                    author="露营研究员",
+                    like_count="1.2万",
+                    extract_method="search_initial_state",
+                ),
+                NoteItem(
+                    keyword="露营装备",
+                    note_id="abc123",
+                    publish_time="6月18日",
+                    publish_date="2026-06-18",
+                    visible_text="新手露营装备清单 露营研究员 6月18日 1.2万",
+                    extract_method="search_dom_card",
+                ),
+            ]
+        )
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0].publish_date, "2026-06-18")
+        self.assertEqual(items[0].like_count, "1.2万")
+        self.assertEqual(items[0].extract_method, "search_initial_state+search_dom_card")
+
+    def test_note_item_to_row_persists_only_standard_publish_date(self) -> None:
+        row = note_item_to_row(NoteItem(keyword="露营", publish_time="昨天", publish_date="2026-06-24"))
+        self.assertEqual(row["publish_date"], "2026-06-24")
+        self.assertNotIn("publish_time", row)
+
 
 class DedupeTests(unittest.TestCase):
     def test_build_hard_duplicate_key_priority(self) -> None:
@@ -217,6 +254,25 @@ class DedupeTests(unittest.TestCase):
         out = clean_dataframe(df)
         self.assertEqual(out["is_video"].tolist(), [False, True])
 
+    def test_clean_dataframe_drops_legacy_publish_time(self) -> None:
+        df = pd.DataFrame(
+            [
+                {
+                    "note_id": "a",
+                    "title": "露营清单",
+                    "author": "作者",
+                    "link": "https://example.com/a",
+                    "publish_time": "2024.8.3",
+                    "publish_date": "",
+                    "like_count": "10",
+                    "rank": 1,
+                }
+            ]
+        )
+        out = clean_dataframe(df)
+        self.assertEqual(out.loc[0, "publish_date"], "")
+        self.assertNotIn("publish_time", out.columns)
+
 
 class TimeParseTests(unittest.TestCase):
     def test_normalize_publish_date(self) -> None:
@@ -225,16 +281,6 @@ class TimeParseTests(unittest.TestCase):
         self.assertEqual(normalize_publish_date("6月18日", now), "2026-06-18")
         self.assertEqual(normalize_publish_date("3天前", now), "2026-06-19")
         self.assertEqual(normalize_publish_date("昨天", now), "2026-06-21")
-
-
-class ReportRenderTests(unittest.TestCase):
-    def test_md_list_does_not_split_string_into_characters(self) -> None:
-        lines = md_list("本期露营装备领域互动两极分化。")
-        self.assertEqual(lines, ["- 本期露营装备领域互动两极分化。"])
-
-    def test_md_list_supports_varied_llm_dict_keys(self) -> None:
-        lines = md_list([{"conclusion": "清单类内容需求强", "description": "高频词包含露营清单"}])
-        self.assertEqual(lines, ["- 清单类内容需求强：高频词包含露营清单"])
 
 
 class EvidenceTests(unittest.TestCase):
@@ -322,6 +368,21 @@ class SearchSignalTests(unittest.TestCase):
         df = pd.DataFrame([{"title": "露营灯实测", "content_pattern": "人工打法"}])
         out = add_content_patterns(df)
         self.assertEqual(out.loc[0, "content_pattern"], "人工打法")
+
+    def test_author_records_use_author_id_not_default_name(self) -> None:
+        df = pd.DataFrame(
+            [
+                {"author": "momo", "author_id": "", "title": "默认名A"},
+                {"author": "momo", "author_id": "u1", "title": "用户1"},
+                {"author": "momo", "author_id": "u2", "title": "用户2"},
+                {"author": "momo", "author_id": "u1", "title": "用户1第二条"},
+            ]
+        )
+        records = build_top_author_records(df)
+        self.assertEqual(records[0]["author_key"], "xhs_user:u1")
+        self.assertEqual(records[0]["count"], 2)
+        self.assertEqual(records[1]["author_key"], "xhs_user:u2")
+        self.assertEqual(len(records), 2)
 
     def test_entity_and_demand_signals_are_included(self) -> None:
         df = pd.DataFrame(
@@ -501,6 +562,18 @@ class MarketReportTests(unittest.TestCase):
                 "topics": [{"topic": "露营装备", "note_count": 4, "note_share": 0.33, "avg_likes": 100}],
                 "content_patterns": [{"content_pattern": "清单", "note_count": 3, "note_share": 0.25, "avg_likes": 120}],
                 "top_authors": [{"name": "作者A", "count": 2}],
+                "top_title_terms": [{"term": "装备清单", "count": 3}],
+            },
+            "case_tables": {
+                "top_liked_notes": [
+                    {
+                        "title": "新手露营装备清单",
+                        "topic_name": "露营装备",
+                        "like_count_num": 100,
+                        "collect_count_num": 20,
+                        "comment_count_num": 5,
+                    }
+                ],
             },
             "representative_evidence": [
                 {
@@ -514,8 +587,15 @@ class MarketReportTests(unittest.TestCase):
             ],
         }
         analysis = deterministic_market_analysis(payload)
+        analysis["low_priority_suggestions"] = [{"suggestion": "继续观察清单内容"}]
         report = render_market_report(payload, analysis)
         self.assertIn("不推断全市场规模", report)
+        self.assertIn("## 样本指标", report)
+        self.assertIn("## 高频标题词", report)
+        self.assertIn("## 高互动样本", report)
+        self.assertIn("## AI延申观察", report)
+        self.assertIn("以下内容不是市场结论，也不是行动建议", report)
+        self.assertNotIn("低优先级建议", report)
         self.assertIn("ev_20260622_camping_search_abc", report)
 
     def test_llm_input_builder_returns_compressed_keys_when_files_missing(self) -> None:
@@ -547,6 +627,13 @@ class MarketReportTests(unittest.TestCase):
         self.assertEqual(cleaned["evidence_cases"][0]["evidence_id"], "")
         self.assertTrue(any(issue["type"] == "forbidden_claim" for issue in validation["issues"]))
 
+    def test_market_analysis_validation_filters_author_without_allowed_key(self) -> None:
+        llm_input = {"signals": {"top_authors": []}, "representative_evidence": []}
+        analysis = {"author_findings": [{"author": "momo", "author_key": "xhs_user:momo", "finding": "出现很多次"}]}
+        cleaned, validation = validate_market_analysis(analysis, llm_input)
+        self.assertEqual(cleaned["author_findings"], [])
+        self.assertTrue(any(issue["type"] == "invalid_author_identity" for issue in validation["issues"]))
+
 
 class MemoryTests(unittest.TestCase):
     def test_low_quality_memory_update_is_blocked(self) -> None:
@@ -558,7 +645,7 @@ class MemoryTests(unittest.TestCase):
         signals = {
             "topics": [{"topic": "露营装备", "note_count": 5, "note_share": 0.4, "avg_likes": 120}],
             "content_patterns": [{"content_pattern": "清单", "note_count": 4, "note_share": 0.3, "avg_likes": 110}],
-            "top_authors": [{"name": "作者A", "count": 2}],
+            "top_authors": [{"name": "作者A", "author_key": "xhs_user:u1", "author_id": "u1", "count": 2}],
         }
         quality = {"quality_level": "high", "memory_update_allowed": True}
         market_analysis = {
@@ -740,7 +827,7 @@ class RollupTests(unittest.TestCase):
                 "metrics_summary": {"clean_count": 10, "high_like_rate": 0.2},
                 "top_topics": [{"topic": "露营装备", "note_count": 4}],
                 "top_content_patterns": [{"content_pattern": "清单", "note_count": 3}],
-                "top_authors": [{"name": "作者A", "count": 2}],
+                "top_authors": [{"name": "作者A", "author_key": "xhs_user:u1", "author_id": "u1", "count": 2}],
                 "evidence_cases": [{"evidence_id": "ev_1"}],
             },
             {
@@ -750,7 +837,7 @@ class RollupTests(unittest.TestCase):
                 "metrics_summary": {"clean_count": 20, "high_like_rate": 0.1},
                 "top_topics": [{"topic": "露营装备", "note_count": 5}, {"topic": "露营灯", "note_count": 2}],
                 "top_content_patterns": [{"content_pattern": "测评", "note_count": 4}],
-                "top_authors": [{"name": "作者B", "count": 1}],
+                "top_authors": [{"name": "作者B", "author_key": "xhs_user:u2", "author_id": "u2", "count": 1}],
                 "evidence_cases": [{"evidence_id": "ev_2"}],
             },
         ]
@@ -845,7 +932,7 @@ class TrendStoreTests(unittest.TestCase):
             "verification_status": "needs_verification",
             "top_topics": [{"topic": "露营灯", "note_count": 3}],
             "top_content_patterns": [{"content_pattern": "清单", "note_count": 2}],
-            "top_authors": [{"name": "作者A", "count": 2}],
+            "top_authors": [{"name": "作者A", "author_key": "xhs_user:u1", "author_id": "u1", "count": 2}],
         }
         events = build_trend_events(summary, update_decision={"pending_disappeared_topics": ["露营装备"]})
         event_types = {event["event_type"] for event in events}

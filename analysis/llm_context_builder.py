@@ -69,6 +69,23 @@ def _representative_evidence(records: list[dict[str, Any]], limit: int = 20) -> 
     return [{field: item.get(field) for field in keep_fields} for item in ranked[:limit]]
 
 
+def _case_records(items: Any, limit: int = 8) -> list[dict[str, Any]]:
+    keep_fields = [
+        "title",
+        "author",
+        "keyword",
+        "publish_date",
+        "like_count_num",
+        "collect_count_num",
+        "comment_count_num",
+        "share_count_num",
+        "topic_name",
+        "content_pattern",
+        "link",
+    ]
+    return [{field: item.get(field) for field in keep_fields} for item in _top_items(items, limit) if isinstance(item, dict)]
+
+
 def build_llm_input(*, domain_id: str, date_str: str, domain: dict[str, Any] | None = None) -> dict[str, Any]:
     processed = processed_dir(domain_id)
     metrics = load_json(processed / f"{date_str}_metrics.json", {})
@@ -101,14 +118,24 @@ def build_llm_input(*, domain_id: str, date_str: str, domain: dict[str, Any] | N
             "clean_count": metrics.get("clean_count", 0),
             "dedupe_rate": metrics.get("dedupe_rate", 0),
             "publish_date_present_rate": metrics.get("publish_date_present_rate", 0),
+            "publish_date_present_count": metrics.get("publish_date_present_count", 0),
+            "recent_publish_days": metrics.get("recent_publish_days", 7),
+            "recent_publish_count": metrics.get("recent_publish_count", 0),
             "recent_publish_ratio": metrics.get("recent_publish_ratio", 0),
             "avg_likes": metrics.get("avg_likes", 0),
             "median_likes": metrics.get("median_likes", 0),
             "p90_likes": metrics.get("p90_likes", 0),
             "collect_like_ratio": metrics.get("collect_like_ratio", 0),
             "comment_like_ratio": metrics.get("comment_like_ratio", 0),
+            "share_like_ratio": metrics.get("share_like_ratio", 0),
             "video_rate": metrics.get("video_rate", 0),
             "high_like_rate": metrics.get("high_like_rate", 0),
+            "high_like_count": metrics.get("high_like_count", 0),
+        },
+        "case_tables": {
+            "top_liked_notes": _case_records(metrics.get("top_notes"), 8),
+            "top_collected_notes": _case_records(metrics.get("top_collected_notes"), 8),
+            "top_discussed_notes": _case_records(metrics.get("top_discussed_notes"), 8),
         },
         "signals": {
             "topics": _top_items(signals.get("topics"), 12),
@@ -122,7 +149,7 @@ def build_llm_input(*, domain_id: str, date_str: str, domain: dict[str, Any] | N
         },
         "representative_evidence": _representative_evidence(evidence_records, 20),
         "requirements": {
-            "analysis_focus": "现有局势分析为主，建议为低优先级",
+            "analysis_focus": "现有局势分析为主；如需提到后续动作，只能写成待验证方向",
             "important_claims_need_evidence_id": True,
             "write_uncertainties_when_quality_low": True,
             "output_language": "zh-CN",

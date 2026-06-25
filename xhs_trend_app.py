@@ -39,12 +39,12 @@ from pipeline.common import load_domains_config
 from storage.paths import (
     evidence_dir,
     get_project_root,
+    market_report_dir,
     memory_dir,
     memory_trends_dir,
     memory_wiki_dir,
     normalize_date,
     processed_dir,
-    report_dir,
 )
 
 
@@ -93,8 +93,74 @@ def read_jsonl(path: Path, limit: int = 10) -> list[dict[str, Any]]:
     return records
 
 
+STATUS_LABELS = {
+    "success": "成功",
+    "failed": "失败",
+    "running": "运行中",
+    "pending": "等待中",
+    "skipped": "跳过",
+    "unknown": "未知",
+}
+
+QUALITY_LABELS = {
+    "high": "高",
+    "medium": "中",
+    "low": "低",
+    "invalid": "无效",
+    "unknown": "未知",
+}
+
+WARNING_LABELS = {
+    "publish_date_present_rate_low": "发布时间缺失较多，近期趋势判断已降级",
+    "clean_count_low": "清洗后样本较少",
+    "raw_count_low": "原始样本较少",
+    "duplicate_rate_high": "重复样本比例较高",
+    "missing_like_rate_high": "互动数字缺失较多",
+}
+
+RECOMMENDATION_LABELS = {
+    "content_pattern_rules_need_expansion": "内容打法规则需要扩充",
+    "topic_taxonomy_need_expansion": "主题分类规则需要扩充",
+    "topic_taxonomy_low_coverage": "主题规则覆盖率偏低",
+}
+
+PIPELINE_STEP_LABELS = {
+    "run_daily": "采集搜索页",
+    "clean_notes": "清洗与去重",
+    "apply_manual_corrections": "应用人工纠错",
+    "sample_detail_pages": "生成详情页抽样清单",
+    "analyze_images": "下载封面图",
+    "compute_metrics": "计算基础指标",
+    "compute_search_page_signals": "计算搜索页信号",
+    "evaluate_rules": "评估规则覆盖",
+    "suggest_rule_candidates": "生成规则候选",
+    "generate_evidence": "生成证据索引",
+    "evaluate_data_quality": "评估数据质量",
+    "merge_history_clean": "合并历史清洗数据",
+    "generate_market_report": "生成市场局势报告",
+    "update_memory": "更新分层记忆",
+    "update_rollups": "更新周/月汇总",
+    "update_knowledge_base": "更新知识库",
+}
+
+
+def label_value(value: Any, labels: dict[str, str]) -> str:
+    key = str(value or "unknown")
+    return labels.get(key, key)
+
+
+def bool_label(value: Any) -> str:
+    return "是" if bool(value) else "否"
+
+
+def translated_list(values: list[Any], labels: dict[str, str]) -> str:
+    translated = [label_value(value, labels) for value in values if str(value).strip()]
+    return "、".join(translated) or "无"
+
+
 class CommandWorker(QThread):
     line = Signal(str)
+    step_progress = Signal(str, int, int, str)
     finished_ok = Signal(bool)
 
     def __init__(
@@ -114,8 +180,10 @@ class CommandWorker(QThread):
     def run(self) -> None:
         ok = True
         init_status(self.domain_id, self.date_str, [step for step, _ in self.commands])
-        for step, command in self.commands:
+        total = len(self.commands)
+        for index, (step, command) in enumerate(self.commands, start=1):
             update_step(self.domain_id, self.date_str, step, status="running")
+            self.step_progress.emit(step, index - 1, total, "running")
             self.line.emit("> " + " ".join(command))
             process = subprocess.Popen(
                 command,
@@ -134,9 +202,11 @@ class CommandWorker(QThread):
             if code != 0:
                 self.line.emit(f"命令失败，退出码：{code}")
                 update_step(self.domain_id, self.date_str, step, status="failed", exit_code=code, error=f"exit_code={code}")
+                self.step_progress.emit(step, index - 1, total, "failed")
                 ok = False
                 break
             update_step(self.domain_id, self.date_str, step, status="success", exit_code=0)
+            self.step_progress.emit(step, index, total, "success")
         self.finished_ok.emit(ok)
 
 
@@ -207,10 +277,10 @@ class MainWindow(QMainWindow):
         self.load_domains()
 
     def _build_ui(self) -> None:
-        tabs = QTabWidget()
-        tabs.addTab(self._build_project_tab(), "项目与关键词")
-        tabs.addTab(self._build_run_tab(), "采集与报告")
-        self.setCentralWidget(tabs)
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self._build_project_tab(), "项目与关键词")
+        self.tabs.addTab(self._build_run_tab(), "采集与报告")
+        self.setCentralWidget(self.tabs)
 
     def _build_project_tab(self) -> QWidget:
         root = QWidget()
@@ -310,9 +380,11 @@ class MainWindow(QMainWindow):
         self.run_update_memory = QCheckBox("更新记忆")
         self.run_update_memory.setChecked(True)
         self.run_update_kb = QCheckBox("更新知识库")
+        self.show_run_details = QCheckBox("显示运行详情")
+        self.show_run_details.toggled.connect(self.update_run_detail_visibility)
         run_btn = QPushButton("运行完整流程")
         run_btn.clicked.connect(self.run_pipeline)
-        report_btn = QPushButton("打开日报")
+        report_btn = QPushButton("打开主报告")
         report_btn.clicked.connect(self.load_report)
         status_btn = QPushButton("刷新状态")
         status_btn.clicked.connect(self.load_run_status)
@@ -338,6 +410,7 @@ class MainWindow(QMainWindow):
         top.addWidget(self.run_market_report)
         top.addWidget(self.run_update_memory)
         top.addWidget(self.run_update_kb)
+        top.addWidget(self.show_run_details)
         top.addWidget(run_btn)
         top.addWidget(report_btn)
         top.addWidget(status_btn)
@@ -349,19 +422,23 @@ class MainWindow(QMainWindow):
         top.addWidget(trends_btn)
         layout.addLayout(top)
 
-        splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.run_status_summary = QLabel("未运行")
+        self.run_status_summary.setWordWrap(True)
+        layout.addWidget(self.run_status_summary)
+
+        self.report_view = QTextBrowser()
+        self.report_view.setMarkdown("选择项目和日期后点击“运行完整流程”，这里会显示进度和市场局势报告。")
+        layout.addWidget(self.report_view, stretch=1)
+
+        self.detail_panel = QSplitter(Qt.Orientation.Horizontal)
         self.log_view = QPlainTextEdit()
         self.log_view.setReadOnly(True)
-        right_panel = QSplitter(Qt.Orientation.Vertical)
         self.status_view = QTextBrowser()
-        self.report_view = QTextBrowser()
-        right_panel.addWidget(self.status_view)
-        right_panel.addWidget(self.report_view)
-        right_panel.setSizes([220, 560])
-        splitter.addWidget(self.log_view)
-        splitter.addWidget(right_panel)
-        splitter.setSizes([480, 780])
-        layout.addWidget(splitter)
+        self.detail_panel.addWidget(self.status_view)
+        self.detail_panel.addWidget(self.log_view)
+        self.detail_panel.setSizes([520, 520])
+        layout.addWidget(self.detail_panel)
+        self.update_run_detail_visibility(False)
         return root
 
     def load_domains(self) -> None:
@@ -466,6 +543,44 @@ class MainWindow(QMainWindow):
         self.seed_keywords.setPlainText("\n".join(merged))
         self.keyword_result.setPlainText(raw_json)
 
+    def update_run_detail_visibility(self, checked: bool) -> None:
+        if hasattr(self, "detail_panel"):
+            self.detail_panel.setVisible(bool(checked))
+        if checked and hasattr(self, "status_view"):
+            self.load_run_status()
+
+    def set_run_summary(self, text: str) -> None:
+        self.run_status_summary.setText(text)
+
+    def show_running_placeholder(self, *, domain_id: str, date_str: str, step: str, completed: int, total: int) -> None:
+        step_label = PIPELINE_STEP_LABELS.get(step, step)
+        self.set_run_summary(f"运行中｜当前步骤：{step_label}｜进度：{completed}/{total}")
+        self.report_view.setMarkdown(
+            "\n".join(
+                [
+                    "# 正在运行分析",
+                    "",
+                    f"- 项目：`{domain_id}`",
+                    f"- 日期：`{date_str}`",
+                    f"- 当前步骤：`{step_label}`",
+                    f"- 已完成：`{completed} / {total}`",
+                    "",
+                    "报告生成后会自动显示在这里。",
+                ]
+            )
+        )
+
+    def on_step_progress(self, step: str, completed: int, total: int, status: str) -> None:
+        context = self.current_run_context()
+        domain_id, date_str = context if context else ("", "")
+        step_label = PIPELINE_STEP_LABELS.get(step, step)
+        if status == "running":
+            self.show_running_placeholder(domain_id=domain_id, date_str=date_str, step=step, completed=completed, total=total)
+        elif status == "success":
+            self.set_run_summary(f"运行中｜已完成：{completed}/{total}｜刚完成：{step_label}")
+        elif status == "failed":
+            self.set_run_summary(f"失败｜失败步骤：{step_label}｜进度：{completed}/{total}")
+
     def append_log(self, text: str) -> None:
         self.log_view.appendPlainText(text)
         self.log_view.moveCursor(QTextCursor.MoveOperation.End)
@@ -489,7 +604,6 @@ class MainWindow(QMainWindow):
             ("clean_notes", [py, "-m", "pipeline.clean_notes", "--domain", domain_id, "--date", date_value]),
             ("apply_manual_corrections", [py, "-m", "pipeline.apply_manual_corrections", "--domain", domain_id, "--date", date_value]),
             ("sample_detail_pages", [py, "-m", "pipeline.sample_detail_pages", "--domain", domain_id, "--date", date_value]),
-            ("analyze_images", [py, "-m", "pipeline.analyze_images", "--domain", domain_id, "--date", date_value]),
             ("compute_metrics", [py, "-m", "pipeline.compute_metrics", "--domain", domain_id, "--date", date_value]),
             ("compute_search_page_signals", [py, "-m", "pipeline.compute_search_page_signals", "--domain", domain_id, "--date", date_value]),
             ("generate_evidence", [py, "-m", "pipeline.generate_evidence", "--domain", domain_id, "--date", date_value]),
@@ -497,7 +611,7 @@ class MainWindow(QMainWindow):
             ("merge_history_clean", [py, "-m", "pipeline.merge_history_clean", "--domain", domain_id, "--date", date_value, "--days", "30"]),
         ]
         if self.run_download_images.isChecked():
-            commands[4][1].append("--download")
+            commands.insert(4, ("analyze_images", [py, "-m", "pipeline.analyze_images", "--domain", domain_id, "--date", date_value, "--download"]))
         if self.run_detail_sampling.isChecked():
             commands[3][1].append("--enable")
         if self.run_rule_analysis.isChecked():
@@ -515,14 +629,30 @@ class MainWindow(QMainWindow):
                     ("update_rollups", [py, "-m", "pipeline.update_rollups", "--domain", domain_id, "--date", date_value]),
                 ]
             )
-        commands.append(("generate_report", [py, "-m", "pipeline.generate_report", "--domain", domain_id, "--date", date_value]))
         if self.run_update_kb.isChecked():
             commands.append(("update_knowledge_base", [py, "-m", "pipeline.update_knowledge_base", "--domain", domain_id, "--date", date_value]))
+        self.tabs.setCurrentIndex(1)
         self.log_view.clear()
+        self.status_view.clear()
+        self.show_run_details.setChecked(False)
+        self.set_run_summary(f"准备运行｜项目：{domain_id}｜日期：{date_str}｜步骤数：{len(commands)}")
+        self.report_view.setMarkdown(
+            "\n".join(
+                [
+                    "# 正在运行分析",
+                    "",
+                    f"- 项目：`{domain_id}`",
+                    f"- 日期：`{date_str}`",
+                    f"- 已完成：`0 / {len(commands)}`",
+                    "",
+                    "流程开始后会显示当前步骤，报告生成后会自动显示在这里。",
+                ]
+            )
+        )
         self.append_log(f"开始运行项目：{domain_id}")
-        self.load_run_status()
         self.worker = CommandWorker(commands, env, domain_id=domain_id, date_str=date_str)
         self.worker.line.connect(self.append_log)
+        self.worker.step_progress.connect(self.on_step_progress)
         self.worker.finished_ok.connect(self.on_pipeline_finished)
         self.worker.start()
 
@@ -530,7 +660,13 @@ class MainWindow(QMainWindow):
         self.append_log("流程完成。" if ok else "流程中断。")
         self.load_run_status()
         if ok:
+            self.set_run_summary("完成｜主报告已生成")
             self.load_report()
+        else:
+            self.show_run_details.setChecked(True)
+            self.report_view.setMarkdown(
+                "# 流程中断\n\n本次分析没有完整生成报告。已展开运行详情，请查看失败步骤和日志。"
+            )
 
     def current_run_context(self) -> tuple[str, str] | None:
         domain_id = self.run_domain.currentData()
@@ -554,11 +690,11 @@ class MainWindow(QMainWindow):
                 [
                     "## 数据质量",
                     "",
-                    f"- 等级：`{quality.get('quality_level', 'unknown')}`",
-                    f"- raw_count：`{quality.get('raw_count', 0)}`",
-                    f"- clean_count：`{quality.get('clean_count', 0)}`",
-                    f"- memory_update_allowed：`{quality.get('memory_update_allowed', False)}`",
-                    f"- warnings：`{', '.join(quality.get('warnings', [])) or '无'}`",
+                    f"- 质量等级：`{label_value(quality.get('quality_level'), QUALITY_LABELS)}`",
+                    f"- 原始样本数：`{quality.get('raw_count', 0)}`",
+                    f"- 清洗后样本数：`{quality.get('clean_count', 0)}`",
+                    f"- 允许更新长期记忆：`{bool_label(quality.get('memory_update_allowed', False))}`",
+                    f"- 风险提示：`{translated_list(quality.get('warnings', []), WARNING_LABELS)}`",
                     "",
                 ]
             )
@@ -572,11 +708,11 @@ class MainWindow(QMainWindow):
                 [
                     "## 规则覆盖",
                     "",
-                    f"- content_pattern covered_rate：`{pattern.get('covered_rate', 0):.2%}`",
-                    f"- content_pattern other_rate：`{pattern.get('other_rate', 0):.2%}`",
-                    f"- topic covered_rate：`{topic.get('covered_rate', 0):.2%}`",
-                    f"- topic taxonomy_rule_rate：`{topic.get('taxonomy_rule_rate', 0):.2%}`",
-                    f"- recommendations：`{', '.join(rule_effectiveness.get('recommendations', [])) or '无'}`",
+                    f"- 内容打法识别覆盖率：`{pattern.get('covered_rate', 0):.2%}`",
+                    f"- 内容打法未识别比例：`{pattern.get('other_rate', 0):.2%}`",
+                    f"- 主题识别覆盖率：`{topic.get('covered_rate', 0):.2%}`",
+                    f"- 主题规则命中率：`{topic.get('taxonomy_rule_rate', 0):.2%}`",
+                    f"- 规则改进提示：`{translated_list(rule_effectiveness.get('recommendations', []), RECOMMENDATION_LABELS)}`",
                     "",
                 ]
             )
@@ -586,23 +722,32 @@ class MainWindow(QMainWindow):
                 [
                     "## 规则候选",
                     "",
-                    f"- content_pattern candidates：`{summary.get('content_pattern_candidate_count', 0)}`",
-                    f"- topic candidates：`{summary.get('topic_candidate_count', 0)}`",
+                    f"- 内容打法候选数：`{summary.get('content_pattern_candidate_count', 0)}`",
+                    f"- 主题候选数：`{summary.get('topic_candidate_count', 0)}`",
                     "",
                 ]
             )
 
-        lines.extend(["## Pipeline", ""])
+        lines.extend(["## 流程执行", ""])
         if status:
-            lines.append(f"- overall_status：`{status.get('overall_status', 'unknown')}`")
+            overall = label_value(status.get("overall_status"), STATUS_LABELS)
+            lines.append(f"- 整体状态：`{overall}`")
             for step in status.get("steps", []):
                 name = step.get("name", "")
                 step_status = step.get("status", "")
                 error = step.get("error", "")
-                suffix = f"，error: {error}" if error else ""
-                lines.append(f"- `{name}`：{step_status}{suffix}")
+                suffix = f"，错误：{error}" if error else ""
+                display_name = PIPELINE_STEP_LABELS.get(name, name)
+                display_status = label_value(step_status, STATUS_LABELS)
+                lines.append(f"- {display_name}：`{display_status}`{suffix}")
+            completed = sum(1 for step in status.get("steps", []) if step.get("status") == "success")
+            total = len(status.get("steps", []))
+            quality_text = label_value(quality.get("quality_level"), QUALITY_LABELS) if quality else "未知"
+            clean_count = quality.get("clean_count", 0) if quality else 0
+            self.set_run_summary(f"整体状态：{overall}｜数据质量：{quality_text}｜样本：{clean_count}｜步骤：{completed}/{total}")
         else:
             lines.append("- 暂无 pipeline_status 文件。")
+            self.set_run_summary("未运行｜暂无流程状态")
         self.status_view.setMarkdown("\n".join(lines))
 
     def load_current_state(self) -> None:
@@ -731,10 +876,9 @@ class MainWindow(QMainWindow):
         if not context:
             return
         domain_id, date_str = context
-        market_path = ROOT / "projects" / str(domain_id) / "reports" / "market" / f"{date_str}_小红书市场局势报告.md"
-        path = market_path if market_path.exists() else report_dir(date_str, domain_id) / f"{date_str}_小红书趋势日报.md"
+        path = market_report_dir(domain_id) / f"{date_str}_小红书市场局势报告.md"
         if not path.exists():
-            QMessageBox.warning(self, "找不到日报", f"日报不存在：{path}")
+            QMessageBox.warning(self, "找不到主报告", f"市场局势报告不存在：{path}")
             return
         self.report_view.setMarkdown(path.read_text(encoding="utf-8"))
 

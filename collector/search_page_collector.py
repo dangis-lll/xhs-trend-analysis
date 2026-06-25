@@ -17,6 +17,40 @@ from playwright.async_api import async_playwright
 
 XHS_HOME = "https://www.xiaohongshu.com"
 DEFAULT_PROFILE_DIR = Path("browser_profile").resolve()
+PERSISTED_NOTE_COLUMNS = [
+    "crawl_date",
+    "crawl_time",
+    "domain_id",
+    "domain_name",
+    "keyword",
+    "rank",
+    "title",
+    "author",
+    "publish_date",
+    "link",
+    "note_id",
+    "xsec_token",
+    "model_type",
+    "note_type",
+    "author_id",
+    "author_avatar",
+    "cover_url",
+    "cover_width",
+    "cover_height",
+    "cover_file_id",
+    "like_count",
+    "collect_count",
+    "comment_count",
+    "share_count",
+    "interaction_count",
+    "is_video",
+    "video_duration",
+    "data_attrs",
+    "visible_text",
+    "extract_method",
+    "quality_flags",
+    "source_file",
+]
 
 
 @dataclass
@@ -54,6 +88,12 @@ class NoteItem:
     extract_method: str = "search_page_card"
     quality_flags: str = ""
     source_file: str = ""
+
+
+def note_item_to_row(item: NoteItem) -> dict[str, Any]:
+    row = asdict(item)
+    row.pop("publish_time", None)
+    return row
 
 
 def build_search_url(keyword: str) -> str:
@@ -148,16 +188,56 @@ def pick_metric(text: str, names: list[str]) -> str:
     return ""
 
 
-def dedupe_notes(items: list[NoteItem]) -> list[NoteItem]:
-    seen: set[str] = set()
-    unique: list[NoteItem] = []
-    for item in items:
-        key = item.note_id or item.link or f"{item.title}|{item.author}|{item.visible_text[:80]}"
-        if not key or key in seen:
+def note_dedupe_key(item: NoteItem) -> str:
+    return item.note_id or item.link or f"{item.title}|{item.author}|{item.visible_text[:80]}"
+
+
+def merge_note_item(base: NoteItem, incoming: NoteItem) -> NoteItem:
+    """Fill missing fields on a stable search item with data from another extractor."""
+    for field_name in NoteItem.__dataclass_fields__:
+        if field_name in {"rank", "data_attrs", "extract_method", "quality_flags"}:
             continue
-        seen.add(key)
-        unique.append(item)
-    return unique
+        current = getattr(base, field_name)
+        candidate = getattr(incoming, field_name)
+        if current in {"", 0, False, None} and candidate not in {"", 0, False, None}:
+            setattr(base, field_name, candidate)
+
+    if not base.publish_time and incoming.visible_text:
+        base.publish_time = pick_publish_time(incoming.visible_text)
+        base.publish_date = normalize_publish_date(base.publish_time)
+    elif base.publish_time and not base.publish_date:
+        base.publish_date = normalize_publish_date(base.publish_time)
+
+    if incoming.rank and (not base.rank or incoming.rank < base.rank):
+        base.rank = incoming.rank
+
+    methods = [part for part in [base.extract_method, incoming.extract_method] if part]
+    if methods:
+        base.extract_method = "+".join(dict.fromkeys(methods))
+
+    attrs = [part for part in [base.data_attrs, incoming.data_attrs] if part]
+    if attrs:
+        base.data_attrs = "\n".join(dict.fromkeys(attrs))
+
+    if incoming.visible_text and incoming.visible_text not in base.visible_text:
+        base.visible_text = normalize_space(" ".join([base.visible_text, incoming.visible_text]))
+
+    return base
+
+
+def dedupe_notes(items: list[NoteItem]) -> list[NoteItem]:
+    by_key: dict[str, NoteItem] = {}
+    order: list[str] = []
+    for item in items:
+        key = note_dedupe_key(item)
+        if not key:
+            continue
+        if key in by_key:
+            merge_note_item(by_key[key], item)
+            continue
+        by_key[key] = item
+        order.append(key)
+    return [by_key[key] for key in order]
 
 
 def first_image_url(cover: dict[str, Any]) -> str:
@@ -471,6 +551,7 @@ async def extract_notes_from_page(page: Any, keyword: str) -> list[NoteItem]:
                 interaction_count=interaction_count,
                 data_attrs=json.dumps(raw.get("data_attrs") or {}, ensure_ascii=False),
                 visible_text=visible_text,
+                extract_method="search_dom_card",
             )
         )
     return dedupe_notes([*initial_state_items, *items])
@@ -569,44 +650,10 @@ async def collect_keyword(
 
 def save_outputs(items: list[NoteItem], output: Path) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
-    rows = [asdict(item) for item in items]
+    rows = [note_item_to_row(item) for item in items]
     df = pd.DataFrame(
         rows,
-        columns=[
-            "crawl_date",
-            "crawl_time",
-            "domain_id",
-            "domain_name",
-            "keyword",
-            "rank",
-            "title",
-            "author",
-            "publish_time",
-            "publish_date",
-            "link",
-            "note_id",
-            "xsec_token",
-            "model_type",
-            "note_type",
-            "author_id",
-            "author_avatar",
-            "cover_url",
-            "cover_width",
-            "cover_height",
-            "cover_file_id",
-            "like_count",
-            "collect_count",
-            "comment_count",
-            "share_count",
-            "interaction_count",
-            "is_video",
-            "video_duration",
-            "data_attrs",
-            "visible_text",
-            "extract_method",
-            "quality_flags",
-            "source_file",
-        ],
+        columns=PERSISTED_NOTE_COLUMNS,
     )
     df.to_excel(output, index=False)
     json_path = output.with_suffix(".json")

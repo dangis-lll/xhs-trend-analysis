@@ -5,7 +5,6 @@ import asyncio
 import json
 import re
 import sys
-from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -15,7 +14,7 @@ import yaml
 
 from analysis.run_guard import load_run_state, record_run_failure, record_run_start, record_run_success, should_skip_run
 from storage.paths import browser_profile_dir, ensure_dirs, get_project_root, normalize_date, raw_dir
-from collector.search_page_collector import collect_keyword, enrich_items
+from collector.search_page_collector import PERSISTED_NOTE_COLUMNS, collect_keyword, enrich_items, note_item_to_row
 
 
 def safe_filename(text: str) -> str:
@@ -46,31 +45,7 @@ def pick_keywords(domain: dict[str, Any], limit: int | None = None) -> list[str]
 
 
 def rows_to_frame(rows: list[dict[str, Any]]) -> pd.DataFrame:
-    columns = [
-        "crawl_date",
-        "crawl_time",
-        "domain_id",
-        "domain_name",
-        "keyword",
-        "rank",
-        "title",
-        "author",
-        "publish_time",
-        "publish_date",
-        "link",
-        "note_id",
-        "cover_url",
-        "like_count",
-        "collect_count",
-        "comment_count",
-        "interaction_count",
-        "data_attrs",
-        "visible_text",
-        "extract_method",
-        "quality_flags",
-        "source_file",
-    ]
-    return pd.DataFrame(rows, columns=columns)
+    return pd.DataFrame(rows, columns=PERSISTED_NOTE_COLUMNS)
 
 
 def save_keyword_raw(rows: list[dict[str, Any]], output_base: Path) -> None:
@@ -175,7 +150,7 @@ async def run_daily(args: argparse.Namespace) -> int:
             domain_name=str(domain.get("name") or ""),
             source_file=source_file,
         )
-        rows = [asdict(item) for item in items]
+        rows = [note_item_to_row(item) for item in items]
         save_keyword_raw(rows, raw_dir(date_str, project_id) / file_stem)
         all_rows.extend(rows)
 
