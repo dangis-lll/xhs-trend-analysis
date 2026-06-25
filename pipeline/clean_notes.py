@@ -8,8 +8,9 @@ import pandas as pd
 from analysis.dedupe import hard_dedupe
 from analysis.image_analyzer import add_image_analysis_placeholders
 from analysis.metrics import parse_count
+from analysis.rule_loader import load_topic_rules
 from analysis.topic_cluster import assign_rule_topics, semantic_dedupe_placeholder
-from storage.paths import ensure_dirs, normalize_date, processed_dir, raw_dir
+from storage.paths import ensure_dirs, memory_dir, normalize_date, processed_dir, raw_dir
 
 
 def parse_bool(value) -> bool:
@@ -24,7 +25,11 @@ def load_raw(date_str: str, project_id: str) -> pd.DataFrame:
     return pd.read_excel(path)
 
 
-def clean_dataframe(raw_df: pd.DataFrame, domain_id: str | None = None) -> pd.DataFrame:
+def clean_dataframe(
+    raw_df: pd.DataFrame,
+    domain_id: str | None = None,
+    topic_rules: dict[str, list[str]] | None = None,
+) -> pd.DataFrame:
     df = raw_df.copy()
     if domain_id and "domain_id" in df.columns:
         df = df[df["domain_id"].fillna("").astype(str) == domain_id].copy()
@@ -68,7 +73,7 @@ def clean_dataframe(raw_df: pd.DataFrame, domain_id: str | None = None) -> pd.Da
     df.loc[df["publish_date"].eq(""), "quality_score"] -= 10
     df.loc[df["like_count_num"].isna(), "quality_score"] -= 10
     df = add_image_analysis_placeholders(df)
-    df = assign_rule_topics(df)
+    df = assign_rule_topics(df, topic_rules=topic_rules)
     df = semantic_dedupe_placeholder(df)
     return df.reset_index(drop=True)
 
@@ -94,7 +99,8 @@ def main() -> int:
     date_str = normalize_date(args.date)
     try:
         raw_df = load_raw(date_str, args.domain)
-        clean_df = clean_dataframe(raw_df, args.domain)
+        domain_taxonomy_path = memory_dir(args.domain) / "taxonomy.yaml"
+        clean_df = clean_dataframe(raw_df, args.domain, load_topic_rules(domain_path=domain_taxonomy_path))
         xlsx_path, csv_path = save_clean(clean_df, date_str, args.domain)
     except Exception as exc:
         print(f"清洗失败：{exc}", file=sys.stderr)

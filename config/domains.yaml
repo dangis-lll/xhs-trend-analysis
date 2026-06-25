@@ -29,3 +29,7 @@ domains:
     login_timeout: 180
     slow_mo: 0
     headless: false
+    circuit_breaker_failure_threshold: 2
+  schedule:
+    schedule_enabled: false
+    preferred_time: "09:30"

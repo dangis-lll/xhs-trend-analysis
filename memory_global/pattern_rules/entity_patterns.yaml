@@ -1,0 +1,29 @@
+entity_patterns:
+  ip:
+    keywords:
+      - IP
+      - ip
+      - 联名
+      - 动漫
+      - 角色
+      - 谷圈
+  product:
+    keywords:
+      - 周边
+      - 徽章
+      - 立牌
+      - 吧唧
+      - 亚克力
+      - 贴纸
+      - 挂件
+      - 娃娃
+      - 手办
+      - 卡套
+  brand:
+    keywords:
+      - 品牌
+      - 官方
+      - 旗舰店
+      - 工厂
+      - 厂家
+      - 代工

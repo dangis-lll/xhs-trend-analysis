@@ -13,6 +13,7 @@ from typing import Any
 import pandas as pd
 import yaml
 
+from analysis.run_guard import load_run_state, record_run_failure, record_run_start, record_run_success, should_skip_run
 from storage.paths import browser_profile_dir, ensure_dirs, get_project_root, normalize_date, raw_dir
 from collector.search_page_collector import collect_keyword, enrich_items
 
@@ -90,10 +91,29 @@ async def run_daily(args: argparse.Namespace) -> int:
     collection = domain.get("collection", {}) or {}
     date_str = normalize_date(args.date)
     ensure_dirs(date_str, project_id)
+    run_type = "scheduled" if args.scheduled else "manual"
+    failure_threshold = args.failure_threshold or int(collection.get("circuit_breaker_failure_threshold") or 2)
+    skip, reason = should_skip_run(
+        load_run_state(project_id),
+        date_str=date_str,
+        force=args.force,
+        once_per_day=args.once_per_day,
+    )
+    if skip:
+        print(f"跳过采集：{reason}。如需强制运行，请添加 --force。")
+        return 0
+    record_run_start(project_id, date_str=date_str, run_type=run_type)
 
     keywords = pick_keywords(domain, args.keywords_per_day)
     if not keywords:
         print("配置中没有可采集的关键词。", file=sys.stderr)
+        record_run_failure(
+            project_id,
+            date_str=date_str,
+            error="配置中没有可采集的关键词",
+            run_type=run_type,
+            failure_threshold=failure_threshold,
+        )
         return 2
 
     notes_per_keyword = args.notes_per_keyword or int(collection.get("notes_per_keyword") or 50)
@@ -111,6 +131,7 @@ async def run_daily(args: argparse.Namespace) -> int:
     print(f"开始采集领域：{domain.get('name', args.domain)}（{args.domain}）")
     print(f"采集日期：{date_str}；关键词数：{len(keywords)}；每词目标：{notes_per_keyword}")
 
+    consecutive_keyword_failures = 0
     for index, keyword in enumerate(keywords, start=1):
         remaining = max_daily_notes - len(all_rows) if max_daily_notes else notes_per_keyword
         if max_daily_notes and remaining <= 0:
@@ -120,14 +141,30 @@ async def run_daily(args: argparse.Namespace) -> int:
         crawl_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         print(f"[{index}/{len(keywords)}] 搜索关键词：{keyword}，目标 {count} 条")
 
-        items = await collect_keyword(
-            keyword=keyword,
-            count=count,
-            profile_dir=profile_dir,
-            headless=headless,
-            login_timeout=login_timeout,
-            slow_mo=slow_mo,
-        )
+        try:
+            items = await collect_keyword(
+                keyword=keyword,
+                count=count,
+                profile_dir=profile_dir,
+                headless=headless,
+                login_timeout=login_timeout,
+                slow_mo=slow_mo,
+            )
+            consecutive_keyword_failures = 0
+        except Exception as exc:
+            consecutive_keyword_failures += 1
+            print(f"关键词采集失败：{keyword}；错误：{exc}", file=sys.stderr)
+            if consecutive_keyword_failures >= failure_threshold:
+                record_run_failure(
+                    project_id,
+                    date_str=date_str,
+                    error=f"连续 {consecutive_keyword_failures} 个关键词采集失败；最后错误：{exc}",
+                    run_type=run_type,
+                    failure_threshold=failure_threshold,
+                )
+                print("连续失败达到阈值，触发本日熔断。", file=sys.stderr)
+                return 1
+            continue
         file_stem = f"{date_str}_{args.domain}_{index:02d}_{safe_filename(keyword)}"
         source_file = str((raw_dir(date_str, project_id) / f"{file_stem}.xlsx").resolve())
         enrich_items(
@@ -150,6 +187,16 @@ async def run_daily(args: argparse.Namespace) -> int:
     print(f"已合并当天原始 Excel：{all_xlsx}")
     print(f"已合并当天原始 JSON：{all_json}")
     print(f"完成：共采集 {len(all_rows)} 条。")
+    if not all_rows:
+        record_run_failure(
+            project_id,
+            date_str=date_str,
+            error="本次采集没有得到任何搜索页样本",
+            run_type=run_type,
+            failure_threshold=failure_threshold,
+        )
+        return 1
+    record_run_success(project_id, date_str=date_str, row_count=len(all_rows), run_type=run_type)
     return 0
 
 
@@ -164,6 +211,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--login-timeout", type=int, default=None, help="覆盖配置中的 login_timeout")
     parser.add_argument("--slow-mo", type=int, default=None, help="覆盖配置中的 slow_mo")
     parser.add_argument("--headless", action="store_true", help="覆盖配置，使用无头模式")
+    parser.add_argument("--once-per-day", action="store_true", help="同一领域同一天已有成功采集时跳过")
+    parser.add_argument("--force", action="store_true", help="忽略一天一次限制和本日熔断，强制采集")
+    parser.add_argument("--scheduled", action="store_true", help="标记为自动调度运行")
+    parser.add_argument("--failure-threshold", type=int, default=None, help="连续关键词失败达到该数量后触发本日熔断")
     return parser.parse_args()
 
 

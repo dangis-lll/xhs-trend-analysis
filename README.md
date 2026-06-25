@@ -1,6 +1,6 @@
 # 小红书趋势分析工具
 
-这是一个面向小红书搜索结果页的趋势分析工具。它按领域项目管理关键词，自动打开 Chrome 采集搜索页可见信息，清洗去重后计算趋势指标，并生成 Markdown 日报。
+这是一个面向小红书搜索结果页的趋势分析工具。它按领域项目管理关键词，自动打开 Chrome 采集搜索页可见信息，清洗去重后计算趋势指标、证据、长期记忆和市场局势报告。
 
 工具只分析搜索页能拿到的信息，不进入笔记详情页。
 
@@ -12,8 +12,10 @@
 - 采集搜索页结构化数据和卡片可见信息，包括标题、作者、链接、封面、点赞、收藏、评论、分享、图文/视频类型等。
 - 清洗、硬去重、标准化互动数字和发布时间。
 - 计算趋势指标：高赞率、近期发布占比、收藏/点赞比、评论/点赞比、视频占比、主题动能、近 3 天上升词等。
-- 生成趋势日报，重点输出趋势总览、热点信号、主题动能、内容结构模式、风险和验证计划。
-- 可选下载封面图、更新轻量知识库。
+- 生成趋势日报和市场局势报告，重点输出搜索页局势、主题、内容打法、作者和证据。
+- 按领域隔离长期记忆，维护 `current_state`、wiki、daily summary、rollup、趋势表和实体索引。
+- 用 `evidence_id` 约束重要判断，降低 LLM 直接分析原始表导致的幻觉。
+- 支持数据质量降级、连续失败熔断、规则候选、人工纠错、可选详情页抽样目标和轻量知识库更新。
 
 ## 环境依赖
 
@@ -51,7 +53,7 @@ python xhs_trend_app.py
 - 设置每日关键词数、每词采集数、每日总上限、登录等待时间
 - 调用 DeepSeek 扩展关键词
 - 一键运行采集、清洗、封面分析、指标计算、历史合并、日报生成
-- 查看生成的 Markdown 日报
+- 查看日报、市场报告、证据、记忆、wiki、规则候选、人工纠错文件和长期趋势表
 
 DeepSeek API Key 不会保存到项目文件。可以在界面输入，也可以设置环境变量：
 
@@ -81,9 +83,18 @@ python xhs_trend_app.py
 ```powershell
 python -m pipeline.run_daily --domain camping --date today
 python -m pipeline.clean_notes --domain camping --date today
+python -m pipeline.apply_manual_corrections --domain camping --date today
 python -m pipeline.analyze_images --domain camping --date today
 python -m pipeline.compute_metrics --domain camping --date today
-python -m pipeline.merge_raw --domain camping --date today --days 30
+python -m pipeline.compute_search_page_signals --domain camping --date today
+python -m pipeline.evaluate_rules --domain camping --date today
+python -m pipeline.suggest_rule_candidates --domain camping --date today
+python -m pipeline.generate_evidence --domain camping --date today
+python -m pipeline.evaluate_data_quality --domain camping --date today
+python -m pipeline.merge_history_clean --domain camping --date today --days 30
+python -m pipeline.generate_market_report --domain camping --date today
+python -m pipeline.update_memory --domain camping --date today
+python -m pipeline.update_rollups --domain camping --date today
 python -m pipeline.generate_report --domain camping --date today
 ```
 
@@ -93,9 +104,30 @@ python -m pipeline.generate_report --domain camping --date today
 # 下载封面图
 python -m pipeline.analyze_images --domain camping --date today --download
 
+# 只生成少量详情页抽样目标和人工补录模板，不实际进入详情页
+python -m pipeline.sample_detail_pages --domain camping --date today --enable --limit 5
+
 # 把候选关键词追加到轻量知识库
 python -m pipeline.update_knowledge_base --domain camping --date today
+
+# 按 config/domains.yaml 的 schedule 配置执行自动调度检查
+python -m pipeline.run_scheduled --date today
+
+# 预览 Windows 任务计划安装命令，不会真正创建任务
+python -m pipeline.install_windows_task --time 09:30
+
+# 确认后创建/覆盖 Windows 任务计划
+python -m pipeline.install_windows_task --time 09:30 --force --install
 ```
+
+`pipeline.run_daily` 支持运行保护：
+
+```powershell
+python -m pipeline.run_daily --domain camping --date today --once-per-day
+python -m pipeline.run_daily --domain camping --date today --force
+```
+
+连续关键词采集失败达到 `collection.circuit_breaker_failure_threshold` 后，会在 `projects/<domain>/memory/run_state.json` 里记录当天熔断。自动调度会跳过已熔断或当天已成功运行的领域。
 
 单关键词手动采集：
 
@@ -114,8 +146,11 @@ projects/<domain>/
   browser_profile/          # Chrome 登录态
   raw/YYYY-MM-DD/           # 原始采集 Excel/JSON
   processed/                # 清洗数据、指标、候选关键词
+  details/YYYY-MM-DD/       # 可选详情页抽样目标和人工补录模板
   images/YYYY-MM-DD/        # 可选封面图
   reports/daily/            # Markdown 日报
+  reports/market/           # 市场局势报告
+  memory/                   # 分层记忆、证据、趋势表、实体索引、wiki
   knowledge-base/           # 轻量关键词池和运行记录
 ```
 

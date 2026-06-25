@@ -309,5 +309,91 @@ def analyze_with_llm(
         }
 
 
+def analyze_market_context_with_llm(llm_input: dict[str, Any]) -> dict[str, Any]:
+    if not llm_enabled():
+        return {"enabled": False}
+
+    payload = {
+        "context": llm_input,
+        "task": "基于压缩后的结构化搜索页数据，分析当前市场局势。建议内容低优先级。",
+        "hard_rules": [
+            "只能基于 context 中的数据分析。",
+            "不得推断销量、成交、投放、全市场规模、详情页正文或评论区观点。",
+            "重要判断必须引用 representative_evidence 中存在的 evidence_id。",
+            "如果 data_quality 为 low 或 invalid，必须降低判断强度并写入 uncertainties。",
+            "topic 是讨论对象或需求主题，content_pattern 是内容打法，两者不得混写。",
+            "输出严格 JSON，不要 Markdown。",
+        ],
+        "output_schema": {
+            "situation_summary": [
+                {
+                    "summary": "当前搜索页局势概括",
+                    "confidence": "high/medium/low",
+                    "evidence_ids": ["ev_xxx"],
+                }
+            ],
+            "topic_findings": [
+                {
+                    "topic": "主题名",
+                    "finding": "该主题当前样本中的位置和信号",
+                    "confidence": "high/medium/low",
+                    "evidence_ids": ["ev_xxx"],
+                }
+            ],
+            "pattern_findings": [
+                {
+                    "content_pattern": "内容打法",
+                    "finding": "该打法当前样本中的表现",
+                    "confidence": "high/medium/low",
+                    "evidence_ids": ["ev_xxx"],
+                }
+            ],
+            "author_findings": [
+                {
+                    "author": "作者名",
+                    "finding": "作者在样本中的可见度",
+                    "confidence": "high/medium/low",
+                    "evidence_ids": ["ev_xxx"],
+                }
+            ],
+            "evidence_cases": [
+                {
+                    "title": "样本标题",
+                    "why_it_matters": "为什么是代表证据",
+                    "evidence_id": "ev_xxx",
+                }
+            ],
+            "uncertainties": [
+                {
+                    "uncertainty": "不确定性",
+                    "impact": "对判断的影响",
+                }
+            ],
+            "low_priority_suggestions": [
+                {
+                    "suggestion": "少量低优先级建议",
+                    "based_on_evidence_id": "ev_xxx",
+                }
+            ],
+        },
+    }
+    try:
+        content = call_deepseek(
+            [
+                {
+                    "role": "system",
+                    "content": "你是小红书搜索页市场局势分析师。你只解释结构化证据，不自由调用工具，不编造数据，不把搜索页样本夸大成全市场结论。",
+                },
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+            ],
+            temperature=0.2,
+        )
+        result = extract_json_object(content)
+        result["enabled"] = True
+        return result
+    except Exception as exc:
+        return {"enabled": False, "error": str(exc)}
+
+
 def save_llm_input(path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")

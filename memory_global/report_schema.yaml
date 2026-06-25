@@ -1,0 +1,29 @@
+market_analysis:
+  required_array_fields:
+    - situation_summary
+    - topic_findings
+    - pattern_findings
+    - author_findings
+    - evidence_cases
+    - uncertainties
+    - low_priority_suggestions
+  evidence_fields:
+    - evidence_id
+    - evidence_ids
+    - based_on_evidence_id
+  validation:
+    allowed_evidence_source: representative_evidence
+    invalid_evidence_id_action: filter_and_record
+    forbidden_claim_action: record_and_add_uncertainty
+    max_text_length: 500
+  forbidden_claims:
+    - 销量
+    - 成交
+    - 销售额
+    - GMV
+    - 真实投放
+    - 投放预算
+    - 全市场
+    - 市场规模
+    - 评论区都在
+    - 详情页显示

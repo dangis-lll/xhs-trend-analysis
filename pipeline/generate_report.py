@@ -146,7 +146,7 @@ def main() -> int:
         llm_result = analyze_with_llm(metrics, top_notes, metrics.get("top_title_terms", []), trends)
 
         report_path = report_dir(date_str, args.domain) / f"{date_str}_小红书趋势日报.md"
-        llm_input_path = processed_dir(args.domain) / f"{date_str}_llm_input.json"
+        llm_input_path = processed_dir(args.domain) / f"{date_str}_legacy_llm_input.json"
         save_llm_input(
             llm_input_path,
             {

@@ -1,0 +1,3 @@
+{"id":"fix_topic_example","enabled":true,"match":{"note_id":"example_note_id"},"set":{"topic_name":"小众博主推广","topic_cluster_id":"manual_小众博主推广","manual_note":"将误识别主题改为小众博主推广"}}
+{"id":"fix_pattern_example","enabled":true,"match":{"title_contains":"种草合集"},"set":{"content_pattern":"种草","manual_note":"标题明确是种草合集"}}
+{"id":"exclude_irrelevant_example","enabled":true,"match":{"title_contains":"无关样本"},"set":{"exclude_from_analysis":true,"manual_note":"排除跑偏样本"}}
