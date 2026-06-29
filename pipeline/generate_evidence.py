@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 
 import pandas as pd
@@ -8,11 +9,13 @@ import pandas as pd
 from analysis.evidence import (
     add_note_global_ids,
     generate_evidence_map_records,
+    generate_evidence_records_from_observations,
     generate_evidence_records,
     update_note_index,
     upsert_jsonl_by_key,
     write_jsonl,
 )
+from pipeline.clean_artifacts import load_clean_dataframe
 from storage.paths import ensure_dirs, evidence_dir, normalize_date, processed_dir
 
 
@@ -24,10 +27,19 @@ def parse_args() -> argparse.Namespace:
 
 
 def load_clean(date_str: str, domain_id: str) -> pd.DataFrame:
-    path = processed_dir(domain_id) / f"{date_str}_clean_notes.xlsx"
+    return load_clean_dataframe(date_str, domain_id)
+
+
+def load_observations(date_str: str, domain_id: str) -> list[dict]:
+    path = processed_dir(domain_id) / f"{date_str}_clean_observations.jsonl"
     if not path.exists():
-        raise FileNotFoundError(f"找不到清洗结果：{path}")
-    return pd.read_excel(path)
+        return []
+    records = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        records.append(json.loads(line))
+    return records
 
 
 def main() -> int:
@@ -35,12 +47,19 @@ def main() -> int:
     date_str = normalize_date(args.date)
     try:
         ensure_dirs(date_str, args.domain)
-        clean_df = load_clean(date_str, args.domain)
-        clean_with_ids = add_note_global_ids(clean_df)
-        clean_with_ids.to_excel(processed_dir(args.domain) / f"{date_str}_clean_notes.xlsx", index=False)
-        clean_with_ids.to_csv(processed_dir(args.domain) / f"{date_str}_clean_notes.csv", index=False, encoding="utf-8-sig")
-
-        records = generate_evidence_records(clean_with_ids, date_str=date_str, domain_id=args.domain)
+        observations = load_observations(date_str, args.domain)
+        if observations:
+            clean_df = load_clean(date_str, args.domain)
+            records = generate_evidence_records_from_observations(
+                observations,
+                date_str=date_str,
+                domain_id=args.domain,
+                clean_df=clean_df,
+            )
+        else:
+            clean_df = load_clean(date_str, args.domain)
+            clean_with_ids = add_note_global_ids(clean_df)
+            records = generate_evidence_records(clean_with_ids, date_str=date_str, domain_id=args.domain)
         evidence_path = evidence_dir(args.domain) / f"{date_str}_evidence.jsonl"
         evidence_map_path = evidence_dir(args.domain) / "evidence_map.jsonl"
         note_index_path = evidence_dir(args.domain) / "note_index.csv"

@@ -47,8 +47,12 @@ def assign_rule_topics(
     return out
 
 
-def semantic_dedupe_placeholder(df: pd.DataFrame, threshold: float = 0.88) -> pd.DataFrame:
+def add_semantic_dedupe_placeholders(df: pd.DataFrame, threshold: float = 0.88) -> pd.DataFrame:
     out = df.copy()
     out["semantic_duplicate_group_id"] = ""
     out["semantic_similarity_threshold"] = threshold
     return out
+
+
+def semantic_dedupe_placeholder(df: pd.DataFrame, threshold: float = 0.88) -> pd.DataFrame:
+    return add_semantic_dedupe_placeholders(df, threshold)

@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -34,8 +33,9 @@ from PySide6.QtWidgets import (
 )
 
 from analysis.llm_analyzer import DEFAULT_DEEPSEEK_MODEL, expand_keywords_with_llm
-from analysis.pipeline_status import init_status, update_step
 from pipeline.common import load_domains_config
+from pipeline.runner import PipelineRunner
+from pipeline.step_registry import build_step_plan
 from storage.paths import (
     evidence_dir,
     get_project_root,
@@ -72,6 +72,30 @@ def write_domains(domains: list[dict[str, Any]]) -> None:
 
 def keyword_lines(text: str) -> list[str]:
     return [line.strip() for line in text.splitlines() if line.strip()]
+
+
+def default_conservative_collection() -> dict[str, Any]:
+    return {
+        "keyword_delay_min_seconds": 45,
+        "keyword_delay_max_seconds": 120,
+        "scroll_wait_min_ms": 2500,
+        "scroll_wait_max_ms": 7000,
+        "scroll_px_min": 700,
+        "scroll_px_max": 1800,
+        "risk_control_keywords": [
+            "验证码",
+            "安全验证",
+            "访问频繁",
+            "操作频繁",
+            "请稍后再试",
+            "当前环境异常",
+            "账号异常",
+            "网络环境异常",
+            "滑块验证",
+            "人机验证",
+        ],
+        "circuit_breaker_failure_threshold": 2,
+    }
 
 
 def load_json_file(path: Path) -> dict[str, Any]:
@@ -165,49 +189,32 @@ class CommandWorker(QThread):
 
     def __init__(
         self,
-        commands: list[tuple[str, list[str]]],
+        plan,
         env: dict[str, str],
         *,
         domain_id: str,
+        date_value: str,
         date_str: str,
     ) -> None:
         super().__init__()
-        self.commands = commands
+        self.plan = plan
         self.env = env
         self.domain_id = domain_id
+        self.date_value = date_value
         self.date_str = date_str
 
     def run(self) -> None:
-        ok = True
-        init_status(self.domain_id, self.date_str, [step for step, _ in self.commands])
-        total = len(self.commands)
-        for index, (step, command) in enumerate(self.commands, start=1):
-            update_step(self.domain_id, self.date_str, step, status="running")
-            self.step_progress.emit(step, index - 1, total, "running")
-            self.line.emit("> " + " ".join(command))
-            process = subprocess.Popen(
-                command,
-                cwd=str(ROOT),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                env=self.env,
-            )
-            assert process.stdout is not None
-            for line in process.stdout:
-                self.line.emit(line.rstrip())
-            code = process.wait()
-            if code != 0:
-                self.line.emit(f"命令失败，退出码：{code}")
-                update_step(self.domain_id, self.date_str, step, status="failed", exit_code=code, error=f"exit_code={code}")
-                self.step_progress.emit(step, index - 1, total, "failed")
-                ok = False
-                break
-            update_step(self.domain_id, self.date_str, step, status="success", exit_code=0)
-            self.step_progress.emit(step, index, total, "success")
-        self.finished_ok.emit(ok)
+        runner = PipelineRunner(
+            domain_id=self.domain_id,
+            date_value=self.date_value,
+            date_str=self.date_str,
+            plan=self.plan,
+            py=sys.executable,
+            env=self.env,
+            line_callback=self.line.emit,
+            step_callback=lambda step, status, completed, total: self.step_progress.emit(step, completed, total, status),
+        )
+        self.finished_ok.emit(runner.run() == 0)
 
 
 class KeywordWorker(QThread):
@@ -464,11 +471,11 @@ class MainWindow(QMainWindow):
         self.domain_name.setText(str(domain.get("name", "")))
         self.research_brief.setPlainText(str(domain.get("description", "")))
         self.seed_keywords.setPlainText("\n".join(domain.get("seed_keywords", []) or []))
-        self.keywords_per_day.setValue(int(collection.get("keywords_per_day") or 10))
-        self.notes_per_keyword.setValue(int(collection.get("notes_per_keyword") or 50))
-        self.max_daily_notes.setValue(int(collection.get("max_daily_notes") or 500))
+        self.keywords_per_day.setValue(int(collection.get("keywords_per_day") or 3))
+        self.notes_per_keyword.setValue(int(collection.get("notes_per_keyword") or 20))
+        self.max_daily_notes.setValue(int(collection.get("max_daily_notes") or 60))
         self.login_timeout.setValue(int(collection.get("login_timeout") or 180))
-        self.slow_mo.setValue(int(collection.get("slow_mo") or 0))
+        self.slow_mo.setValue(int(collection.get("slow_mo") or 100))
         self.headless.setChecked(bool(collection.get("headless") or False))
 
     def new_domain(self) -> None:
@@ -476,30 +483,41 @@ class MainWindow(QMainWindow):
         self.domain_name.setText("")
         self.research_brief.setPlainText("")
         self.seed_keywords.setPlainText("")
-        self.keywords_per_day.setValue(10)
-        self.notes_per_keyword.setValue(50)
-        self.max_daily_notes.setValue(500)
+        self.keywords_per_day.setValue(3)
+        self.notes_per_keyword.setValue(20)
+        self.max_daily_notes.setValue(60)
         self.login_timeout.setValue(180)
-        self.slow_mo.setValue(0)
+        self.slow_mo.setValue(100)
         self.headless.setChecked(False)
         self.domain_list.clearSelection()
 
     def build_domain_from_form(self) -> dict[str, Any]:
         name = self.domain_name.text().strip()
         domain_id = self.domain_id.text().strip() or safe_id(name)
-        return {
-            "id": domain_id,
-            "name": name or domain_id,
-            "description": self.research_brief.toPlainText().strip(),
-            "seed_keywords": keyword_lines(self.seed_keywords.toPlainText()),
-            "collection": {
+        existing_collection: dict[str, Any] = {}
+        row = self.current_domain_index()
+        if 0 <= row < len(self.domains):
+            current = self.domains[row]
+            if str(current.get("id") or "") == domain_id:
+                existing_collection = dict(current.get("collection", {}) or {})
+        collection = default_conservative_collection()
+        collection.update(existing_collection)
+        collection.update(
+            {
                 "keywords_per_day": self.keywords_per_day.value(),
                 "notes_per_keyword": self.notes_per_keyword.value(),
                 "max_daily_notes": self.max_daily_notes.value(),
                 "login_timeout": self.login_timeout.value(),
                 "slow_mo": self.slow_mo.value(),
                 "headless": self.headless.isChecked(),
-            },
+            }
+        )
+        return {
+            "id": domain_id,
+            "name": name or domain_id,
+            "description": self.research_brief.toPlainText().strip(),
+            "seed_keywords": keyword_lines(self.seed_keywords.toPlainText()),
+            "collection": collection,
         }
 
     def save_current_domain(self) -> None:
@@ -598,44 +616,25 @@ class MainWindow(QMainWindow):
         env["DEEPSEEK_MODEL"] = self.model.text().strip() or DEFAULT_DEEPSEEK_MODEL
         date_value = self.run_date.text().strip() or "today"
         date_str = normalize_date(date_value)
-        py = sys.executable
-        commands = [
-            ("run_daily", [py, "-m", "pipeline.run_daily", "--domain", domain_id, "--date", date_value]),
-            ("clean_notes", [py, "-m", "pipeline.clean_notes", "--domain", domain_id, "--date", date_value]),
-            ("apply_manual_corrections", [py, "-m", "pipeline.apply_manual_corrections", "--domain", domain_id, "--date", date_value]),
-            ("sample_detail_pages", [py, "-m", "pipeline.sample_detail_pages", "--domain", domain_id, "--date", date_value]),
-            ("compute_metrics", [py, "-m", "pipeline.compute_metrics", "--domain", domain_id, "--date", date_value]),
-            ("compute_search_page_signals", [py, "-m", "pipeline.compute_search_page_signals", "--domain", domain_id, "--date", date_value]),
-            ("generate_evidence", [py, "-m", "pipeline.generate_evidence", "--domain", domain_id, "--date", date_value]),
-            ("evaluate_data_quality", [py, "-m", "pipeline.evaluate_data_quality", "--domain", domain_id, "--date", date_value]),
-            ("merge_history_clean", [py, "-m", "pipeline.merge_history_clean", "--domain", domain_id, "--date", date_value, "--days", "30"]),
-        ]
+        enabled_optional = set()
         if self.run_download_images.isChecked():
-            commands.insert(4, ("analyze_images", [py, "-m", "pipeline.analyze_images", "--domain", domain_id, "--date", date_value, "--download"]))
+            enabled_optional.add("analyze_images")
         if self.run_detail_sampling.isChecked():
-            commands[3][1].append("--enable")
+            enabled_optional.add("sample_detail_pages")
         if self.run_rule_analysis.isChecked():
-            insert_at = 7
-            commands[insert_at:insert_at] = [
-                ("evaluate_rules", [py, "-m", "pipeline.evaluate_rules", "--domain", domain_id, "--date", date_value]),
-                ("suggest_rule_candidates", [py, "-m", "pipeline.suggest_rule_candidates", "--domain", domain_id, "--date", date_value]),
-            ]
+            enabled_optional.update({"evaluate_rules", "suggest_rule_candidates"})
         if self.run_market_report.isChecked():
-            commands.append(("generate_market_report", [py, "-m", "pipeline.generate_market_report", "--domain", domain_id, "--date", date_value]))
+            enabled_optional.add("generate_market_report")
         if self.run_update_memory.isChecked():
-            commands.extend(
-                [
-                    ("update_memory", [py, "-m", "pipeline.update_memory", "--domain", domain_id, "--date", date_value]),
-                    ("update_rollups", [py, "-m", "pipeline.update_rollups", "--domain", domain_id, "--date", date_value]),
-                ]
-            )
+            enabled_optional.update({"update_memory", "update_rollups"})
         if self.run_update_kb.isChecked():
-            commands.append(("update_knowledge_base", [py, "-m", "pipeline.update_knowledge_base", "--domain", domain_id, "--date", date_value]))
+            enabled_optional.add("update_knowledge_base")
+        plan = build_step_plan(enabled_optional)
         self.tabs.setCurrentIndex(1)
         self.log_view.clear()
         self.status_view.clear()
         self.show_run_details.setChecked(False)
-        self.set_run_summary(f"准备运行｜项目：{domain_id}｜日期：{date_str}｜步骤数：{len(commands)}")
+        self.set_run_summary(f"准备运行｜项目：{domain_id}｜日期：{date_str}｜步骤数：{len(plan)}")
         self.report_view.setMarkdown(
             "\n".join(
                 [
@@ -643,14 +642,14 @@ class MainWindow(QMainWindow):
                     "",
                     f"- 项目：`{domain_id}`",
                     f"- 日期：`{date_str}`",
-                    f"- 已完成：`0 / {len(commands)}`",
+                    f"- 已完成：`0 / {len(plan)}`",
                     "",
                     "流程开始后会显示当前步骤，报告生成后会自动显示在这里。",
                 ]
             )
         )
         self.append_log(f"开始运行项目：{domain_id}")
-        self.worker = CommandWorker(commands, env, domain_id=domain_id, date_str=date_str)
+        self.worker = CommandWorker(plan, env, domain_id=domain_id, date_value=date_value, date_str=date_str)
         self.worker.line.connect(self.append_log)
         self.worker.step_progress.connect(self.on_step_progress)
         self.worker.finished_ok.connect(self.on_pipeline_finished)

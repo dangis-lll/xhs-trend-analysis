@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from storage.paths import evidence_dir, memory_dir, processed_dir
+from storage.paths import evidence_dir, memory_dir, memory_rollups_dir, processed_dir
 
 
 def load_json(path: Path, default: Any = None) -> Any:
@@ -32,6 +32,42 @@ def current_state_excerpt(domain_id: str, max_chars: int = 3000) -> str:
         return ""
     text = path.read_text(encoding="utf-8").strip()
     return text[:max_chars]
+
+
+def current_state_structured(domain_id: str) -> dict[str, Any]:
+    return load_json(memory_dir(domain_id) / "current_state.json", {}) or {}
+
+
+def latest_rollup(domain_id: str, period_type: str, date_str: str) -> dict[str, Any]:
+    rollup_dir = memory_rollups_dir(domain_id)
+    if not rollup_dir.exists():
+        return {}
+    candidates = []
+    for path in sorted(rollup_dir.glob(f"{period_type}_*_metrics.json")):
+        payload = load_json(path, {})
+        if payload and str(payload.get("end_date", "")) <= date_str:
+            candidates.append(payload)
+    return candidates[-1] if candidates else {}
+
+
+def period_comparison(week_rollup: dict[str, Any], month_rollup: dict[str, Any]) -> dict[str, Any]:
+    if not week_rollup or not month_rollup:
+        return {}
+    week_topics = {item.get("topic"): item.get("score", 0) for item in week_rollup.get("top_topics", [])}
+    month_topics = {item.get("topic"): item.get("score", 0) for item in month_rollup.get("top_topics", [])}
+    shared = sorted(set(week_topics) & set(month_topics))
+    return {
+        "weekly_vs_monthly_avg_clean_count": {
+            "weekly": week_rollup.get("avg_clean_count", 0),
+            "monthly": month_rollup.get("avg_clean_count", 0),
+        },
+        "shared_topics": [
+            {"topic": topic, "weekly_score": week_topics.get(topic, 0), "monthly_score": month_topics.get(topic, 0)}
+            for topic in shared[:10]
+            if topic
+        ],
+        "weekly_only_topics": [topic for topic in week_topics if topic and topic not in month_topics][:10],
+    }
 
 
 def _top_items(items: Any, limit: int = 10) -> list[Any]:
@@ -92,6 +128,8 @@ def build_llm_input(*, domain_id: str, date_str: str, domain: dict[str, Any] | N
     signals = load_json(processed / f"{date_str}_search_signals.json", {})
     quality = load_json(processed / f"{date_str}_data_quality.json", {})
     evidence_records = load_jsonl(evidence_dir(domain_id) / f"{date_str}_evidence.jsonl")
+    week_rollup = latest_rollup(domain_id, "weekly", date_str)
+    month_rollup = latest_rollup(domain_id, "monthly", date_str)
 
     payload = {
         "meta": {
@@ -112,7 +150,12 @@ def build_llm_input(*, domain_id: str, date_str: str, domain: dict[str, Any] | N
             ],
         },
         "data_quality": quality,
+        "previous_current_state": current_state_structured(domain_id),
+        "previous_state_as_of": current_state_structured(domain_id).get("last_updated", ""),
         "current_state_excerpt": current_state_excerpt(domain_id),
+        "recent_week_rollup": week_rollup,
+        "recent_month_rollup": month_rollup,
+        "period_comparison": period_comparison(week_rollup, month_rollup),
         "metrics_summary": {
             "raw_count": metrics.get("raw_count", 0),
             "clean_count": metrics.get("clean_count", 0),

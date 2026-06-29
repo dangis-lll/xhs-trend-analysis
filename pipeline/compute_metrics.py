@@ -9,6 +9,7 @@ import pandas as pd
 from analysis.authors import build_top_author_records
 from analysis.keyword_miner import extract_terms_from_frame, suggest_keywords
 from analysis.metrics import compute_basic_metrics, compute_topic_daily_metrics, top_records, top_title_terms
+from pipeline.clean_artifacts import load_clean_dataframe
 from pipeline.common import domain_keywords, get_domain, load_analysis_config
 from storage.paths import normalize_date, processed_dir, raw_dir
 
@@ -21,10 +22,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def load_clean(date_str: str, domain_id: str) -> pd.DataFrame:
-    path = processed_dir(domain_id) / f"{date_str}_clean_notes.xlsx"
-    if not path.exists():
-        raise FileNotFoundError(f"找不到清洗结果：{path}")
-    return pd.read_excel(path)
+    return load_clean_dataframe(date_str, domain_id)
 
 
 def load_raw(date_str: str, domain_id: str) -> pd.DataFrame:

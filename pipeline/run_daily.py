@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import random
 import re
 import sys
 from datetime import datetime
@@ -10,31 +11,17 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
-import yaml
 
 from analysis.run_guard import load_run_state, record_run_failure, record_run_start, record_run_success, should_skip_run
-from storage.paths import browser_profile_dir, ensure_dirs, get_project_root, normalize_date, raw_dir
 from collector.search_page_collector import PERSISTED_NOTE_COLUMNS, collect_keyword, enrich_items, note_item_to_row
+from collector.search_page_collector import RiskControlDetected
+from pipeline.common import get_domain
+from storage.paths import browser_profile_dir, ensure_dirs, get_project_root, normalize_date, raw_dir
 
 
 def safe_filename(text: str) -> str:
     cleaned = re.sub(r'[\\/:*?"<>|]+', "_", text).strip()
     return cleaned[:60] or "keyword"
-
-
-def load_domains_config(path: Path | None = None) -> dict[str, Any]:
-    config_path = path or get_project_root() / "config" / "domains.yaml"
-    if not config_path.exists():
-        raise FileNotFoundError(f"找不到配置文件：{config_path}")
-    return yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
-
-
-def get_domain(config: dict[str, Any], domain_id: str) -> dict[str, Any]:
-    for domain in config.get("domains", []):
-        if domain.get("id") == domain_id:
-            return domain
-    available = ", ".join(d.get("id", "") for d in config.get("domains", []))
-    raise ValueError(f"找不到 domain={domain_id}。可用 domain：{available or '无'}")
 
 
 def pick_keywords(domain: dict[str, Any], limit: int | None = None) -> list[str]:
@@ -59,9 +46,19 @@ def save_keyword_raw(rows: list[dict[str, Any]], output_base: Path) -> None:
     print(f"已保存关键词 JSON：{json_path}")
 
 
+async def sleep_between_keywords(min_seconds: float, max_seconds: float, *, before_keyword: str = "") -> None:
+    lower = max(0.0, float(min_seconds))
+    upper = max(lower, float(max_seconds))
+    if upper <= 0:
+        return
+    seconds = random.uniform(lower, upper)
+    suffix = f"（下一个关键词：{before_keyword}）" if before_keyword else ""
+    print(f"保守采集暂停 {seconds:.1f} 秒{suffix}。")
+    await asyncio.sleep(seconds)
+
+
 async def run_daily(args: argparse.Namespace) -> int:
-    config = load_domains_config(args.config)
-    domain = get_domain(config, args.domain)
+    domain = get_domain(args.domain, args.config)
     project_id = args.domain
     collection = domain.get("collection", {}) or {}
     date_str = normalize_date(args.date)
@@ -96,6 +93,17 @@ async def run_daily(args: argparse.Namespace) -> int:
     login_timeout = args.login_timeout or int(collection.get("login_timeout") or 180)
     slow_mo = args.slow_mo if args.slow_mo is not None else int(collection.get("slow_mo") or 0)
     headless = args.headless or bool(collection.get("headless") or False)
+    keyword_delay_min = float(collection.get("keyword_delay_min_seconds") or 0)
+    keyword_delay_max = float(collection.get("keyword_delay_max_seconds") or keyword_delay_min)
+    scroll_wait_min_ms = int(collection.get("scroll_wait_min_ms") or 2500)
+    scroll_wait_max_ms = int(collection.get("scroll_wait_max_ms") or 7000)
+    scroll_px_min = int(collection.get("scroll_px_min") or 700)
+    scroll_px_max = int(collection.get("scroll_px_max") or 1800)
+    risk_control_keywords = [
+        str(item).strip()
+        for item in collection.get("risk_control_keywords", [])
+        if str(item).strip()
+    ] or None
     profile_dir = (
         (get_project_root() / collection["profile_dir"]).resolve()
         if collection.get("profile_dir")
@@ -108,6 +116,8 @@ async def run_daily(args: argparse.Namespace) -> int:
 
     consecutive_keyword_failures = 0
     for index, keyword in enumerate(keywords, start=1):
+        if index > 1:
+            await sleep_between_keywords(keyword_delay_min, keyword_delay_max, before_keyword=keyword)
         remaining = max_daily_notes - len(all_rows) if max_daily_notes else notes_per_keyword
         if max_daily_notes and remaining <= 0:
             print(f"已达到 max_daily_notes={max_daily_notes}，停止继续采集。")
@@ -124,8 +134,23 @@ async def run_daily(args: argparse.Namespace) -> int:
                 headless=headless,
                 login_timeout=login_timeout,
                 slow_mo=slow_mo,
+                scroll_wait_min_ms=scroll_wait_min_ms,
+                scroll_wait_max_ms=scroll_wait_max_ms,
+                scroll_px_min=scroll_px_min,
+                scroll_px_max=scroll_px_max,
+                risk_control_keywords=risk_control_keywords,
             )
             consecutive_keyword_failures = 0
+        except RiskControlDetected as exc:
+            print(f"疑似触发小红书风控，停止当天采集：{exc}", file=sys.stderr)
+            record_run_failure(
+                project_id,
+                date_str=date_str,
+                error=f"疑似触发小红书风控，已停止当天采集：{exc}",
+                run_type=run_type,
+                failure_threshold=1,
+            )
+            return 1
         except Exception as exc:
             consecutive_keyword_failures += 1
             print(f"关键词采集失败：{keyword}；错误：{exc}", file=sys.stderr)

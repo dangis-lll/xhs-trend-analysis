@@ -7,6 +7,7 @@ import sys
 import pandas as pd
 
 from analysis.rule_effectiveness import evaluate_rule_effectiveness
+from pipeline.clean_artifacts import load_clean_dataframe
 from storage.paths import normalize_date, processed_dir
 
 
@@ -18,10 +19,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def load_clean(date_str: str, domain_id: str) -> pd.DataFrame:
-    path = processed_dir(domain_id) / f"{date_str}_clean_notes.xlsx"
-    if not path.exists():
-        raise FileNotFoundError(f"找不到清洗结果：{path}")
-    return pd.read_excel(path)
+    return load_clean_dataframe(date_str, domain_id)
 
 
 def main() -> int:

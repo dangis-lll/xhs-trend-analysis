@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+from storage.atomic_io import atomic_write_jsonl
 
 
 def _top(items: Any, limit: int = 8) -> list[dict[str, Any]]:
@@ -111,8 +114,18 @@ def decide_current_state_update(
         }
 
     summaries = recent_summaries or []
+    recent_valid = [summary for summary in summaries[-6:] if summary_is_valid_observation(summary)]
     streaks = {
         topic: consecutive_absent_days(topic, current_summary=daily_summary, recent_summaries=summaries)
+        for topic in disappeared
+    }
+    cooling_evidence = {
+        topic: {
+            "absent_valid_days": streaks.get(topic, 0),
+            "recent_valid_days_checked": 1 + len(recent_valid),
+            "recent_scores": _topic_recent_scores(topic, [*recent_valid, daily_summary]),
+            "quality_weighted": True,
+        }
         for topic in disappeared
     }
     pending = [topic for topic, streak in streaks.items() if streak < cooling_confirm_days]
@@ -129,6 +142,7 @@ def decide_current_state_update(
         "confirmed_disappeared_topics": confirmed,
         "appeared_topics": appeared,
         "cooling_absent_streaks": streaks,
+        "cooling_evidence": cooling_evidence,
     }
 
 
@@ -177,18 +191,46 @@ def build_daily_summary(
     }
 
 
-def render_current_state(*, domain: dict[str, Any], daily_summary: dict[str, Any], previous_text: str = "") -> str:
-    domain_id = daily_summary.get("domain_id", domain.get("id", ""))
-    date_str = daily_summary.get("date", "")
-    quality = daily_summary.get("data_quality", {})
-    verification_status = daily_summary.get("verification_status", "unknown")
-    valid_observation_days = daily_summary.get("valid_observation_days", 0)
-    metrics = daily_summary.get("metrics_summary", {})
-    topics = daily_summary.get("top_topics", [])
-    patterns = daily_summary.get("top_content_patterns", [])
-    authors = daily_summary.get("top_authors", [])
-    uncertainties = daily_summary.get("uncertainties", [])
-    evidence_cases = daily_summary.get("evidence_cases", [])
+def build_current_state_payload(
+    *,
+    domain: dict[str, Any],
+    daily_summary: dict[str, Any],
+    previous_text: str = "",
+) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "domain": {
+            "id": daily_summary.get("domain_id", domain.get("id", "")),
+            "name": domain.get("name", daily_summary.get("domain_id", "")),
+        },
+        "last_updated": daily_summary.get("date", ""),
+        "data_quality": daily_summary.get("data_quality", {}),
+        "verification_status": daily_summary.get("verification_status", "unknown"),
+        "valid_observation_days": daily_summary.get("valid_observation_days", 0),
+        "metrics_summary": daily_summary.get("metrics_summary", {}),
+        "situation_summary": daily_summary.get("situation_summary", []),
+        "top_topics": daily_summary.get("top_topics", []),
+        "top_content_patterns": daily_summary.get("top_content_patterns", []),
+        "top_authors": daily_summary.get("top_authors", []),
+        "evidence_cases": daily_summary.get("evidence_cases", []),
+        "uncertainties": daily_summary.get("uncertainties", []),
+        "previous_topic_index": _extract_section_items(previous_text, "## 主要主题", limit=5) if previous_text else [],
+    }
+
+
+def render_current_state_from_payload(payload: dict[str, Any]) -> str:
+    domain = payload.get("domain", {}) or {}
+    domain_id = domain.get("id", "")
+    date_str = payload.get("last_updated", "")
+    quality = payload.get("data_quality", {})
+    verification_status = payload.get("verification_status", "unknown")
+    valid_observation_days = payload.get("valid_observation_days", 0)
+    metrics = payload.get("metrics_summary", {})
+    topics = payload.get("top_topics", [])
+    patterns = payload.get("top_content_patterns", [])
+    authors = payload.get("top_authors", [])
+    uncertainties = payload.get("uncertainties", [])
+    evidence_cases = payload.get("evidence_cases", [])
 
     lines = [
         f"# {domain.get('name', domain_id)} current_state",
@@ -203,7 +245,7 @@ def render_current_state(*, domain: dict[str, Any], daily_summary: dict[str, Any
         "## 当前搜索页局势",
         "",
     ]
-    situation = daily_summary.get("situation_summary", [])
+    situation = payload.get("situation_summary", [])
     if situation:
         for item in situation:
             lines.append(f"- {item.get('summary') or item.get('finding') or ''}")
@@ -250,15 +292,18 @@ def render_current_state(*, domain: dict[str, Any], daily_summary: dict[str, Any
     if not uncertainties:
         lines.append("- 暂无额外不确定性。")
 
-    if previous_text:
+    previous_items = payload.get("previous_topic_index", [])
+    if previous_items:
         lines.extend(["", "## 上一版索引", ""])
-        old_topics = _extract_section_items(previous_text, "## 主要主题", limit=5)
-        if old_topics:
-            lines.extend(old_topics)
-        else:
-            lines.append("- 未读取到上一版主题索引。")
+        lines.extend(previous_items)
 
     return "\n".join(lines).rstrip() + "\n"
+
+
+def render_current_state(*, domain: dict[str, Any], daily_summary: dict[str, Any], previous_text: str = "") -> str:
+    return render_current_state_from_payload(
+        build_current_state_payload(domain=domain, daily_summary=daily_summary, previous_text=previous_text)
+    )
 
 
 def build_judgment_record(
@@ -270,18 +315,34 @@ def build_judgment_record(
     update_decision: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     decision = update_decision or {}
+    event = "memory_update" if updated_current_state else "memory_observation_only"
+    top_topics = _names(daily_summary.get("top_topics", []), "topic", 5)
+    top_patterns = _names(daily_summary.get("top_content_patterns", []), "content_pattern", 5)
+    record_id = _record_id(
+        "judgment",
+        domain_id,
+        date_str,
+        event,
+        decision.get("resolution_status", "resolved" if updated_current_state else "pending"),
+        decision.get("reason") or ("quality_allowed" if updated_current_state else "quality_blocked_or_disabled"),
+        "|".join(top_topics),
+        "|".join(top_patterns),
+    )
     return {
+        "record_id": record_id,
+        "judgment_id": record_id,
+        "run_id": f"{date_str}_{domain_id}",
         "date": date_str,
         "domain_id": domain_id,
         "created_at": datetime.now().isoformat(timespec="seconds"),
-        "event": "memory_update" if updated_current_state else "memory_observation_only",
+        "event": event,
         "quality_level": daily_summary.get("data_quality", {}).get("quality_level", "unknown"),
         "updated_current_state": updated_current_state,
         "resolution_status": decision.get("resolution_status", "resolved" if updated_current_state else "pending"),
         "verification_status": decision.get("verification_status", "unknown"),
         "valid_observation_days": decision.get("valid_observation_days", 0),
-        "top_topics": _names(daily_summary.get("top_topics", []), "topic", 5),
-        "top_content_patterns": _names(daily_summary.get("top_content_patterns", []), "content_pattern", 5),
+        "top_topics": top_topics,
+        "top_content_patterns": top_patterns,
         "reason": decision.get("reason") or ("quality_allowed" if updated_current_state else "quality_blocked_or_disabled"),
         "pending_disappeared_topics": decision.get("pending_disappeared_topics", []),
         "confirmed_disappeared_topics": decision.get("confirmed_disappeared_topics", []),
@@ -304,15 +365,26 @@ def build_conflict_records(
     decision = update_decision or {}
 
     if not updated_current_state:
+        reason = decision.get("reason") or "低质量或无效数据不覆盖 current_state"
         records.append(
             {
+                "record_id": _record_id(
+                    "conflict",
+                    domain_id,
+                    date_str,
+                    "quality_blocked_memory_update",
+                    decision.get("resolution_status", "pending_observation"),
+                    reason,
+                    "|".join(current_topics),
+                ),
+                "run_id": f"{date_str}_{domain_id}",
                 "date": date_str,
                 "domain_id": domain_id,
                 "created_at": datetime.now().isoformat(timespec="seconds"),
                 "type": "quality_blocked_memory_update",
                 "status": decision.get("resolution_status", "pending_observation"),
                 "quality_level": quality.get("quality_level", "unknown"),
-                "reason": decision.get("reason") or "低质量或无效数据不覆盖 current_state",
+                "reason": reason,
                 "current_topics": current_topics,
                 "pending_disappeared_topics": decision.get("pending_disappeared_topics", []),
             }
@@ -322,14 +394,26 @@ def build_conflict_records(
         disappeared = [topic for topic in previous_topics if topic not in current_topics]
         appeared = [topic for topic in current_topics if topic not in previous_topics]
         if disappeared or appeared:
+            reason = decision.get("reason") or "current_state 中的主题集合与当天样本主题集合不同，需观察是否连续出现"
             records.append(
                 {
+                    "record_id": _record_id(
+                        "conflict",
+                        domain_id,
+                        date_str,
+                        "topic_set_changed",
+                        decision.get("resolution_status", "pending_observation"),
+                        "|".join(appeared),
+                        "|".join(disappeared),
+                        reason,
+                    ),
+                    "run_id": f"{date_str}_{domain_id}",
                     "date": date_str,
                     "domain_id": domain_id,
                     "created_at": datetime.now().isoformat(timespec="seconds"),
                     "type": "topic_set_changed",
                     "status": decision.get("resolution_status", "pending_observation"),
-                    "reason": decision.get("reason") or "current_state 中的主题集合与当天样本主题集合不同，需观察是否连续出现",
+                    "reason": reason,
                     "appeared_topics": appeared,
                     "disappeared_topics": disappeared,
                     "pending_disappeared_topics": decision.get("pending_disappeared_topics", []),
@@ -343,8 +427,43 @@ def build_conflict_records(
 
 def append_jsonl(path: Path, record: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8", newline="\n") as handle:
-        handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+    record_key = str(record.get("record_id") or record.get("judgment_id") or record.get("id") or "").strip()
+    if not record_key:
+        records: list[dict[str, Any]] = []
+        if path.exists():
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    records.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+        records.append(record)
+        atomic_write_jsonl(path, records)
+        return
+
+    by_key: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    if path.exists():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                existing = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            existing_key = str(
+                existing.get("record_id") or existing.get("judgment_id") or existing.get("id") or ""
+            ).strip()
+            if not existing_key:
+                existing_key = _record_id("legacy", line)
+            if existing_key not in by_key:
+                order.append(existing_key)
+            by_key[existing_key] = existing
+    if record_key not in by_key:
+        order.append(record_key)
+    by_key[record_key] = record
+    atomic_write_jsonl(path, [by_key[key] for key in order])
 
 
 def _extract_section_items(text: str, heading: str, limit: int = 5) -> list[str]:
@@ -380,3 +499,29 @@ def _parse_date(value: str) -> datetime | None:
         return datetime.strptime(value[:10], "%Y-%m-%d")
     except (TypeError, ValueError):
         return None
+
+
+def _topic_recent_scores(topic: str, summaries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows = []
+    for summary in summaries[-7:]:
+        score = 0.0
+        note_count = 0
+        for item in summary.get("top_topics", []) or []:
+            if str(item.get("topic") or item.get("name") or "") == topic:
+                score = float(item.get("signal_score") or item.get("note_share") or item.get("note_count") or 0)
+                note_count = int(item.get("note_count") or 0)
+                break
+        rows.append(
+            {
+                "date": summary.get("date", ""),
+                "quality_level": summary.get("data_quality", {}).get("quality_level", "unknown"),
+                "score": score,
+                "note_count": note_count,
+            }
+        )
+    return rows
+
+
+def _record_id(*parts: Any) -> str:
+    seed = "\u0001".join(str(part) for part in parts)
+    return hashlib.sha1(seed.encode("utf-8")).hexdigest()[:16]

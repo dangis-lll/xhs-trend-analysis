@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import hashlib
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+from storage.atomic_io import atomic_write_text
 
 
 def _fmt_date() -> str:
@@ -120,13 +124,32 @@ def render_index(*, domain: dict[str, Any], daily_summary: dict[str, Any], wiki_
 
 def append_wiki_log(path: Path, *, date_str: str, event: str, details: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    prefix = f"## [{_fmt_date()}] {event} | {date_str}"
-    entry = f"{prefix}\n\n{details.strip()}\n\n"
-    if path.exists():
-        existing = path.read_text(encoding="utf-8")
-        path.write_text(existing.rstrip() + "\n\n" + entry, encoding="utf-8")
-    else:
-        path.write_text("# Wiki Log\n\n" + entry, encoding="utf-8")
+    clean_details = details.strip()
+    log_id = _log_id(date_str, event, clean_details)
+    prefix = f"## [{_fmt_date()}] {event} | {date_str} <!-- log_id:{log_id} -->"
+    entry = f"{prefix}\n\n{clean_details}\n\n"
+    if not path.exists():
+        atomic_write_text(path, "# Wiki Log\n\n" + entry, encoding="utf-8")
+        return
+
+    existing = path.read_text(encoding="utf-8")
+    marker = f"<!-- log_id:{log_id} -->"
+    if marker not in existing:
+        atomic_write_text(path, existing.rstrip() + "\n\n" + entry, encoding="utf-8")
+        return
+
+    parts = re.split(r"(?=^## \[)", existing, flags=re.MULTILINE)
+    replaced = False
+    out_parts = []
+    for part in parts:
+        if marker in part:
+            out_parts.append(entry)
+            replaced = True
+        else:
+            out_parts.append(part)
+    if not replaced:
+        out_parts.append(entry)
+    atomic_write_text(path, "".join(out_parts).rstrip() + "\n", encoding="utf-8")
 
 
 def update_wiki_files(
@@ -162,3 +185,8 @@ def update_wiki_files(
         "index": index_path,
         "log": log_path,
     }
+
+
+def _log_id(date_str: str, event: str, details: str) -> str:
+    seed = f"{date_str}\u0001{event}\u0001{details}"
+    return hashlib.sha1(seed.encode("utf-8")).hexdigest()[:16]

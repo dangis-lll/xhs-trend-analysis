@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -10,25 +9,9 @@ from typing import Any
 
 from analysis.run_guard import load_run_state, should_skip_run
 from pipeline.common import load_domains_config
+from pipeline.runner import PipelineRunner
+from pipeline.step_registry import DEFAULT_SCHEDULED_STEPS, STEP_BY_NAME
 from storage.paths import normalize_date
-
-
-DEFAULT_STEPS = [
-    "run_daily",
-    "clean_notes",
-    "apply_manual_corrections",
-    "compute_metrics",
-    "compute_search_page_signals",
-    "evaluate_rules",
-    "suggest_rule_candidates",
-    "generate_evidence",
-    "evaluate_data_quality",
-    "merge_history_clean",
-    "generate_market_report",
-    "update_memory",
-    "update_rollups",
-    "update_knowledge_base",
-]
 
 
 def parse_time(value: str) -> tuple[int, int]:
@@ -51,15 +34,6 @@ def is_due(domain: dict[str, Any], *, now: datetime) -> tuple[bool, str]:
     return True, "due"
 
 
-def build_step_command(step: str, *, domain_id: str, date_value: str, py: str) -> list[str]:
-    base = [py, "-m", f"pipeline.{step}", "--domain", domain_id, "--date", date_value]
-    if step == "run_daily":
-        base.extend(["--scheduled", "--once-per-day"])
-    if step == "merge_history_clean":
-        base.extend(["--days", "30"])
-    return base
-
-
 def run_domain_pipeline(
     *,
     domain_id: str,
@@ -70,16 +44,17 @@ def run_domain_pipeline(
     py = sys.executable
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
-    for step in steps:
-        command = build_step_command(step, domain_id=domain_id, date_value=date_value, py=py)
-        print(f"[{domain_id}] {step}: {' '.join(command)}")
-        if dry_run:
-            continue
-        completed = subprocess.run(command, env=env, text=True)
-        if completed.returncode != 0:
-            print(f"[{domain_id}] 步骤失败：{step}，退出码 {completed.returncode}", file=sys.stderr)
-            return completed.returncode
-    return 0
+    plan = [STEP_BY_NAME[step] for step in steps]
+    return PipelineRunner(
+        domain_id=domain_id,
+        date_value=date_value,
+        date_str=normalize_date(date_value),
+        plan=plan,
+        py=py,
+        env=env,
+        scheduled=True,
+        dry_run=dry_run,
+    ).run()
 
 
 def parse_args() -> argparse.Namespace:
@@ -88,7 +63,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", type=Path, default=None, help="domains.yaml 路径")
     parser.add_argument("--domain", default="", help="只检查指定 domain")
     parser.add_argument("--dry-run", action="store_true", help="只输出将要执行的步骤")
-    parser.add_argument("--steps", default=",".join(DEFAULT_STEPS), help="逗号分隔的 pipeline 步骤")
+    parser.add_argument("--steps", default=",".join(DEFAULT_SCHEDULED_STEPS), help="逗号分隔的 pipeline 步骤")
     return parser.parse_args()
 
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import random
 import re
 import time
 from dataclasses import asdict, dataclass
@@ -17,6 +18,18 @@ from playwright.async_api import async_playwright
 
 XHS_HOME = "https://www.xiaohongshu.com"
 DEFAULT_PROFILE_DIR = Path("browser_profile").resolve()
+DEFAULT_RISK_CONTROL_KEYWORDS = [
+    "验证码",
+    "安全验证",
+    "访问频繁",
+    "操作频繁",
+    "请稍后再试",
+    "当前环境异常",
+    "账号异常",
+    "网络环境异常",
+    "滑块验证",
+    "人机验证",
+]
 PERSISTED_NOTE_COLUMNS = [
     "crawl_date",
     "crawl_time",
@@ -88,6 +101,24 @@ class NoteItem:
     extract_method: str = "search_page_card"
     quality_flags: str = ""
     source_file: str = ""
+
+
+class RiskControlDetected(RuntimeError):
+    """Raised when the page looks blocked by login, captcha, or anti-abuse checks."""
+
+
+def detect_risk_control(text: str, keywords: list[str] | None = None) -> str:
+    haystack = normalize_space(text)
+    for keyword in keywords or DEFAULT_RISK_CONTROL_KEYWORDS:
+        if keyword and keyword in haystack:
+            return keyword
+    return ""
+
+
+async def wait_random_timeout(page: Any, min_ms: int, max_ms: int) -> None:
+    lower = max(0, int(min_ms))
+    upper = max(lower, int(max_ms))
+    await page.wait_for_timeout(random.randint(lower, upper))
 
 
 def note_item_to_row(item: NoteItem) -> dict[str, Any]:
@@ -573,6 +604,16 @@ async def maybe_accept_manual_login(page: Any, login_timeout: int) -> None:
         await asyncio.sleep(5)
 
 
+async def assert_not_risk_controlled(page: Any, *, keywords: list[str] | None = None) -> None:
+    try:
+        text = await page.locator("body").inner_text(timeout=1000)
+    except Exception:
+        return
+    matched = detect_risk_control(text[:3000], keywords)
+    if matched:
+        raise RiskControlDetected(f"页面出现疑似风控/验证提示：{matched}")
+
+
 async def collect_keyword(
     keyword: str,
     count: int,
@@ -580,6 +621,11 @@ async def collect_keyword(
     headless: bool,
     login_timeout: int,
     slow_mo: int,
+    scroll_wait_min_ms: int = 2500,
+    scroll_wait_max_ms: int = 7000,
+    scroll_px_min: int = 700,
+    scroll_px_max: int = 1800,
+    risk_control_keywords: list[str] | None = None,
 ) -> list[NoteItem]:
     async with async_playwright() as p:
         try:
@@ -607,45 +653,50 @@ async def collect_keyword(
                 args=["--disable-blink-features=AutomationControlled"],
             )
 
-        page = context.pages[0] if context.pages else await context.new_page()
-        page.set_default_timeout(15_000)
-
-        await page.goto(build_search_url(keyword), wait_until="domcontentloaded")
-        await maybe_accept_manual_login(page, login_timeout)
-
         try:
-            await page.wait_for_load_state("networkidle", timeout=20_000)
-        except PlaywrightTimeoutError:
-            pass
+            page = context.pages[0] if context.pages else await context.new_page()
+            page.set_default_timeout(15_000)
 
-        items: list[NoteItem] = []
-        last_size = 0
-        stale_rounds = 0
-        max_rounds = max(12, min(80, count * 3))
+            await page.goto(build_search_url(keyword), wait_until="domcontentloaded")
+            await maybe_accept_manual_login(page, login_timeout)
+            await assert_not_risk_controlled(page, keywords=risk_control_keywords)
 
-        for round_index in range(max_rounds):
-            batch = await extract_notes_from_page(page, keyword)
-            items = dedupe_notes([*items, *batch])
-            print(f"第 {round_index + 1} 轮：已提取 {len(items)}/{count} 条")
+            try:
+                await page.wait_for_load_state("networkidle", timeout=20_000)
+            except PlaywrightTimeoutError:
+                pass
+            await assert_not_risk_controlled(page, keywords=risk_control_keywords)
 
-            if len(items) >= count:
-                break
+            items: list[NoteItem] = []
+            last_size = 0
+            stale_rounds = 0
+            max_rounds = max(12, min(80, count * 3))
 
-            if len(items) == last_size:
-                stale_rounds += 1
-            else:
-                stale_rounds = 0
-            last_size = len(items)
+            for round_index in range(max_rounds):
+                await assert_not_risk_controlled(page, keywords=risk_control_keywords)
+                batch = await extract_notes_from_page(page, keyword)
+                items = dedupe_notes([*items, *batch])
+                print(f"第 {round_index + 1} 轮：已提取 {len(items)}/{count} 条")
 
-            if stale_rounds >= 6:
-                print("连续多轮没有新增结果，提前结束。")
-                break
+                if len(items) >= count:
+                    break
 
-            await page.mouse.wheel(0, 1600)
-            await page.wait_for_timeout(1800)
+                if len(items) == last_size:
+                    stale_rounds += 1
+                else:
+                    stale_rounds = 0
+                last_size = len(items)
 
-        await context.close()
-        return items[:count]
+                if stale_rounds >= 6:
+                    print("连续多轮没有新增结果，提前结束。")
+                    break
+
+                await page.mouse.wheel(0, random.randint(max(1, scroll_px_min), max(scroll_px_min, scroll_px_max)))
+                await wait_random_timeout(page, scroll_wait_min_ms, scroll_wait_max_ms)
+
+            return items[:count]
+        finally:
+            await context.close()
 
 
 def save_outputs(items: list[NoteItem], output: Path) -> None:

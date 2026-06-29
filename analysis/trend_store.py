@@ -7,6 +7,8 @@ from typing import Any
 
 import pandas as pd
 
+from storage.atomic_io import atomic_write_jsonl
+
 
 def _clean_text(value: Any) -> str:
     if value is None:
@@ -520,7 +522,8 @@ def append_events_jsonl(path: Path, events: list[dict[str, Any]]) -> None:
     if not events:
         return
     path.parent.mkdir(parents=True, exist_ok=True)
-    existing_ids: set[str] = set()
+    by_id: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
     if path.exists():
         for line in path.read_text(encoding="utf-8").splitlines():
             if not line.strip():
@@ -531,10 +534,14 @@ def append_events_jsonl(path: Path, events: list[dict[str, Any]]) -> None:
                 continue
             event_id = _clean_text(record.get("event_id"))
             if event_id:
-                existing_ids.add(event_id)
-    with path.open("a", encoding="utf-8", newline="\n") as handle:
-        for event in events:
-            if event["event_id"] in existing_ids:
-                continue
-            handle.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
-            existing_ids.add(event["event_id"])
+                if event_id not in by_id:
+                    order.append(event_id)
+                by_id[event_id] = record
+    for event in events:
+        event_id = _clean_text(event.get("event_id"))
+        if not event_id:
+            continue
+        if event_id not in by_id:
+            order.append(event_id)
+        by_id[event_id] = event
+    atomic_write_jsonl(path, [by_id[event_id] for event_id in order])

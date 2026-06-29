@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from pipeline.clean_artifacts import resolve_clean_path
 from storage.paths import normalize_date, processed_dir
 
 
@@ -27,7 +28,10 @@ def read_clean_snapshot(path: Path) -> pd.DataFrame | None:
 def merge_history_clean(domain_id: str, date_str: str, days: int = 30) -> tuple[pd.DataFrame, Path]:
     frames = []
     for day in date_range(date_str, days):
-        path = processed_dir(domain_id) / f"{day}_clean_notes.xlsx"
+        try:
+            path = resolve_clean_path(day, domain_id)
+        except FileNotFoundError:
+            continue
         snapshot = read_clean_snapshot(path)
         if snapshot is not None:
             snapshot = snapshot.copy()

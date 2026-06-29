@@ -23,12 +23,29 @@ domains:
   - 露营装备开箱视频
   - 露营装备对比测评
   collection:
-    keywords_per_day: 10
-    notes_per_keyword: 50
-    max_daily_notes: 500
+    keywords_per_day: 3
+    notes_per_keyword: 20
+    max_daily_notes: 60
     login_timeout: 180
-    slow_mo: 0
+    slow_mo: 100
     headless: false
+    keyword_delay_min_seconds: 45
+    keyword_delay_max_seconds: 120
+    scroll_wait_min_ms: 2500
+    scroll_wait_max_ms: 7000
+    scroll_px_min: 700
+    scroll_px_max: 1800
+    risk_control_keywords:
+    - 验证码
+    - 安全验证
+    - 访问频繁
+    - 操作频繁
+    - 请稍后再试
+    - 当前环境异常
+    - 账号异常
+    - 网络环境异常
+    - 滑块验证
+    - 人机验证
     circuit_breaker_failure_threshold: 2
   schedule:
     schedule_enabled: false

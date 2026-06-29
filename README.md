@@ -69,6 +69,9 @@ python xhs_trend_app.py
 - `每日关键词数`：每天从关键词池前面取多少个词采集。
 - `每词采集数`：每个关键词目标采集多少条搜索结果。
 - `每日总上限`：当天最多采集多少条，达到后停止。
+- `keyword_delay_min_seconds` / `keyword_delay_max_seconds`：关键词之间随机暂停，默认配置用于降低连续搜索强度。
+- `scroll_wait_min_ms` / `scroll_wait_max_ms`：每次滚动后的随机等待时间。
+- `risk_control_keywords`：页面出现这些提示时会停止当天采集，避免在验证或风控状态下继续滚动。
 - `DeepSeek 扩展数量`：只控制一次让大模型生成多少个候选关键词，不等于每日采集数。
 
 如果关键词池有 30 个词，每日关键词数设为 10，就只采集前 10 个。  
@@ -125,12 +128,12 @@ python -m pipeline.run_daily --domain camping --date today --once-per-day
 python -m pipeline.run_daily --domain camping --date today --force
 ```
 
-连续关键词采集失败达到 `collection.circuit_breaker_failure_threshold` 后，会在 `projects/<domain>/memory/run_state.json` 里记录当天熔断。自动调度会跳过已熔断或当天已成功运行的领域。
+连续关键词采集失败达到 `collection.circuit_breaker_failure_threshold` 后，会在 `projects/<domain>/memory/run_state.json` 里记录当天熔断。自动调度会跳过已熔断或当天已成功运行的领域。若页面出现验证码、访问频繁、安全验证等疑似风控提示，采集会立即停止并记录当天熔断。
 
 单关键词手动采集：
 
 ```powershell
-python manual_collect_keyword.py "露营装备" -n 50 --project camping
+python manual_collect_keyword.py "露营装备" -n 20 --project camping
 ```
 
 首次运行时建议使用可见浏览器。如果小红书要求登录或验证码，请在打开的 Chrome 中手动完成，程序会等待后继续。

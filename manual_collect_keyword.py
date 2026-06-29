@@ -54,6 +54,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--headless", action="store_true", help="无头模式运行，不建议首次登录时使用")
     parser.add_argument("--login-timeout", type=int, default=180, help="等待手动登录/验证码的秒数")
     parser.add_argument("--slow-mo", type=int, default=0, help="Playwright 操作延迟毫秒，调试时可设为 100")
+    parser.add_argument("--scroll-wait-min-ms", type=int, default=2500, help="每次滚动后的最短等待毫秒数")
+    parser.add_argument("--scroll-wait-max-ms", type=int, default=7000, help="每次滚动后的最长等待毫秒数")
+    parser.add_argument("--scroll-px-min", type=int, default=700, help="每次滚动的最小像素")
+    parser.add_argument("--scroll-px-max", type=int, default=1800, help="每次滚动的最大像素")
     return parser.parse_args()
 
 
@@ -85,6 +89,10 @@ async def main_async() -> int:
         headless=args.headless,
         login_timeout=args.login_timeout,
         slow_mo=args.slow_mo,
+        scroll_wait_min_ms=args.scroll_wait_min_ms,
+        scroll_wait_max_ms=args.scroll_wait_max_ms,
+        scroll_px_min=args.scroll_px_min,
+        scroll_px_max=args.scroll_px_max,
     )
     enrich_items(
         items,

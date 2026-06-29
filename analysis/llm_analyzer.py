@@ -141,6 +141,7 @@ def analyze_with_llm(
     terms: list[dict[str, Any]],
     trends: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    """Deprecated: use analyze_market_context_with_llm with structured llm_input."""
     if not llm_enabled():
         return {
             "enabled": False,

@@ -3,10 +3,9 @@ from __future__ import annotations
 import argparse
 import sys
 
-import pandas as pd
-
 from analysis.image_analyzer import add_image_analysis_placeholders, download_cover_images
-from storage.paths import normalize_date, processed_dir
+from pipeline.clean_artifacts import load_clean_dataframe, write_clean_variant
+from storage.paths import normalize_date
 
 
 def parse_args() -> argparse.Namespace:
@@ -20,21 +19,17 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     date_str = normalize_date(args.date)
-    path = processed_dir(args.domain) / f"{date_str}_clean_notes.xlsx"
     if not args.download:
         print("未启用封面图下载，跳过图片分析步骤。")
         return 0
     try:
-        if not path.exists():
-            raise FileNotFoundError(f"找不到清洗结果：{path}")
-        df = pd.read_excel(path)
+        df = load_clean_dataframe(date_str, args.domain)
         out = add_image_analysis_placeholders(download_cover_images(df, date_str, args.domain))
-        out.to_excel(path, index=False)
-        out.to_csv(processed_dir(args.domain) / f"{date_str}_clean_notes.csv", index=False, encoding="utf-8-sig")
+        xlsx_path, _ = write_clean_variant(out, date_str, args.domain, "image_enriched")
     except Exception as exc:
         print(f"图片分析失败：{exc}", file=sys.stderr)
         return 1
-    print(f"已更新图片分析字段：{path}")
+    print(f"已保存图片增强清洗结果：{xlsx_path}")
     return 0
 
 

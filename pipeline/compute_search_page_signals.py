@@ -9,6 +9,7 @@ import pandas as pd
 
 from analysis.rule_loader import load_content_pattern_rules, load_entity_rules
 from analysis.search_page_signals import add_content_patterns, compute_search_page_signals
+from pipeline.clean_artifacts import load_clean_dataframe
 from storage.paths import normalize_date, processed_dir
 
 
@@ -22,10 +23,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def load_clean(date_str: str, domain_id: str) -> pd.DataFrame:
-    path = processed_dir(domain_id) / f"{date_str}_clean_notes.xlsx"
-    if not path.exists():
-        raise FileNotFoundError(f"找不到清洗结果：{path}")
-    return pd.read_excel(path)
+    return load_clean_dataframe(date_str, domain_id)
 
 
 def main() -> int:
@@ -36,9 +34,6 @@ def main() -> int:
         rules = load_content_pattern_rules(Path(args.pattern_rules)) if args.pattern_rules else load_content_pattern_rules()
         entity_rules = load_entity_rules(Path(args.entity_rules)) if args.entity_rules else load_entity_rules()
         clean_with_patterns = add_content_patterns(clean_df, rules)
-        clean_with_patterns.to_excel(processed_dir(args.domain) / f"{date_str}_clean_notes.xlsx", index=False)
-        clean_with_patterns.to_csv(processed_dir(args.domain) / f"{date_str}_clean_notes.csv", index=False, encoding="utf-8-sig")
-
         signals = compute_search_page_signals(
             clean_with_patterns,
             date_str=date_str,

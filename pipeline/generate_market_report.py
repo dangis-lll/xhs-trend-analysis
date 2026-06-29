@@ -8,7 +8,9 @@ from analysis.llm_analyzer import analyze_market_context_with_llm
 from analysis.llm_context_builder import build_llm_input, save_llm_input
 from analysis.market_report import deterministic_market_analysis, render_market_report
 from analysis.report_validator import validate_market_analysis
+from analysis.pipeline_status import update_step
 from pipeline.common import get_domain
+from pipeline.quality_gate import load_quality_gate, write_skip_artifact
 from storage.paths import market_report_dir, normalize_date, processed_dir
 
 
@@ -23,6 +25,29 @@ def main() -> int:
     args = parse_args()
     date_str = normalize_date(args.date)
     try:
+        gate = load_quality_gate(args.domain, date_str)
+        if not gate.report_allowed:
+            reason = ";".join(gate.reasons) or "report_blocked_by_quality_gate"
+            skip_path = processed_dir(args.domain) / f"{date_str}_market_report_skipped.json"
+            write_skip_artifact(
+                skip_path,
+                domain_id=args.domain,
+                date_str=date_str,
+                step="generate_market_report",
+                gate=gate,
+            )
+            update_step(
+                args.domain,
+                date_str,
+                "generate_market_report",
+                status="skipped",
+                exit_code=0,
+                error=reason,
+            )
+            print(f"市场局势报告已跳过：{reason}")
+            print(f"已保存跳过记录：{skip_path}")
+            return 0
+
         domain = get_domain(args.domain)
         llm_input = build_llm_input(domain_id=args.domain, date_str=date_str, domain=domain)
         llm_input_path = save_llm_input(llm_input, domain_id=args.domain, date_str=date_str)
@@ -45,7 +70,9 @@ def main() -> int:
         out_dir.mkdir(parents=True, exist_ok=True)
         report_path = out_dir / f"{date_str}_小红书市场局势报告.md"
         report_path.write_text(report, encoding="utf-8")
+        update_step(args.domain, date_str, "generate_market_report", status="success", exit_code=0)
     except Exception as exc:
+        update_step(args.domain, date_str, "generate_market_report", status="failed", exit_code=1, error=str(exc))
         print(f"市场局势报告生成失败：{exc}", file=sys.stderr)
         return 1
 

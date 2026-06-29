@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
+import sys
 import tempfile
 import unittest
 from datetime import datetime
+from unittest.mock import patch
 
 import pandas as pd
 
 from analysis.authors import build_top_author_records
+from analysis.data_contracts import annotation_id, normalize_observation, note_from_observations
 from analysis.dedupe import build_hard_duplicate_key, hard_dedupe
 from analysis.data_quality import evaluate_quality
 from analysis.detail_sampling import (
@@ -21,6 +25,7 @@ from analysis.evidence import (
     build_note_global_id,
     generate_evidence_map_records,
     generate_evidence_records,
+    generate_evidence_records_from_observations,
     upsert_jsonl_by_key,
 )
 from analysis.entity_miner import mine_demand_signals, mine_entity_candidates
@@ -29,10 +34,12 @@ from analysis.manual_corrections import apply_manual_corrections
 from analysis.market_report import deterministic_market_analysis, render_market_report
 from analysis.memory import (
     build_conflict_records,
+    build_current_state_payload,
     build_daily_summary,
     decide_current_state_update,
     days_since_last_valid_observation,
     memory_update_allowed,
+    render_current_state_from_payload,
     render_current_state,
 )
 from analysis.metrics import compute_basic_metrics, parse_count, recent_publish_mask, tokenize_chinese_text
@@ -70,14 +77,19 @@ from pipeline.update_rollups import build_and_write_period
 from collector.search_page_collector import (
     NoteItem,
     dedupe_notes,
+    detect_risk_control,
     extract_notes_from_initial_state,
     normalize_publish_date,
     note_item_to_row,
+    wait_random_timeout,
 )
-from pipeline.clean_notes import clean_dataframe
+from pipeline.clean_notes import build_clean_observations, clean_dataframe
 from pipeline.install_windows_task import build_schtasks_command, build_task_run_command
 from pipeline.merge_history_clean import date_range
+from pipeline.runner import PipelineRunner
 from pipeline.run_scheduled import is_due
+from pipeline.quality_gate import load_quality_gate
+from pipeline.step_registry import DEFAULT_SCHEDULED_STEPS, build_step_command, build_step_plan, step_names
 
 
 class FakeInitialStatePage:
@@ -112,6 +124,14 @@ class FakeInitialStatePage:
                 },
             }
         ]
+
+
+class FakeTimeoutPage:
+    def __init__(self) -> None:
+        self.waits: list[int] = []
+
+    async def wait_for_timeout(self, timeout_ms: int) -> None:
+        self.waits.append(timeout_ms)
 
 
 class MetricsTests(unittest.TestCase):
@@ -169,6 +189,16 @@ class MetricsTests(unittest.TestCase):
 
 
 class CollectorTests(unittest.TestCase):
+    def test_detect_risk_control_text(self) -> None:
+        self.assertEqual(detect_risk_control("当前访问频繁，请稍后再试"), "访问频繁")
+        self.assertEqual(detect_risk_control("正常搜索结果页面"), "")
+
+    def test_wait_random_timeout_normalizes_bounds(self) -> None:
+        page = FakeTimeoutPage()
+        asyncio.run(wait_random_timeout(page, 7000, 2500))
+        self.assertEqual(len(page.waits), 1)
+        self.assertEqual(page.waits[0], 7000)
+
     def test_extract_notes_from_initial_state(self) -> None:
         items = asyncio.run(extract_notes_from_initial_state(FakeInitialStatePage(), "露营装备"))
         self.assertEqual(len(items), 1)
@@ -273,6 +303,103 @@ class DedupeTests(unittest.TestCase):
         self.assertEqual(out.loc[0, "publish_date"], "")
         self.assertNotIn("publish_time", out.columns)
 
+    def test_clean_observations_preserve_same_note_across_keywords(self) -> None:
+        df = pd.DataFrame(
+            [
+                {
+                    "domain_id": "camping",
+                    "note_id": "a",
+                    "title": "露营清单",
+                    "author": "作者",
+                    "link": "https://example.com/a",
+                    "keyword": "露营",
+                    "rank": 1,
+                    "like_count": "10",
+                    "crawl_time": "2026-06-22 09:00:00",
+                },
+                {
+                    "domain_id": "camping",
+                    "note_id": "a",
+                    "title": "露营清单",
+                    "author": "作者",
+                    "link": "https://example.com/a",
+                    "keyword": "露营装备",
+                    "rank": 3,
+                    "like_count": "10",
+                    "crawl_time": "2026-06-22 09:05:00",
+                },
+            ]
+        )
+        clean = clean_dataframe(df, domain_id="camping")
+        observations = build_clean_observations(df, date_str="2026-06-22", domain_id="camping")
+        self.assertEqual(len(clean), 1)
+        self.assertEqual(len(observations), 2)
+        self.assertEqual({item["keyword"] for item in observations}, {"露营", "露营装备"})
+        self.assertEqual(len({item["note_global_id"] for item in observations}), 1)
+
+
+class DataContractTests(unittest.TestCase):
+    def test_observation_contract_normalizes_and_requires_context(self) -> None:
+        observation = normalize_observation(
+            {
+                "date": "2026-06-22",
+                "domain_id": "camping",
+                "keyword": "露营",
+                "rank": "2",
+                "note_global_id": "ng_note_a",
+                "like_count": "10",
+            }
+        )
+        self.assertTrue(observation["observation_id"].startswith("obs_"))
+        self.assertEqual(observation["rank"], 2)
+        self.assertEqual(observation["like_count"], 10)
+        with self.assertRaises(ValueError):
+            normalize_observation({"date": "2026-06-22", "domain_id": "camping", "note_global_id": "ng"})
+
+    def test_note_and_annotation_contracts_are_stable(self) -> None:
+        observations = [
+            normalize_observation(
+                {
+                    "date": "2026-06-22",
+                    "domain_id": "camping",
+                    "keyword": "露营",
+                    "note_global_id": "ng_note_a",
+                    "note_id": "a",
+                    "title": "露营清单",
+                }
+            ),
+            normalize_observation(
+                {
+                    "date": "2026-06-24",
+                    "domain_id": "camping",
+                    "keyword": "露营装备",
+                    "note_global_id": "ng_note_a",
+                    "note_id": "a",
+                    "title": "露营清单",
+                }
+            ),
+        ]
+        note = note_from_observations(observations)
+        self.assertEqual(note["first_seen_date"], "2026-06-22")
+        self.assertEqual(note["last_seen_date"], "2026-06-24")
+        first = annotation_id(
+            date="2026-06-22",
+            domain_id="camping",
+            note_global_id="ng_note_a",
+            annotation_type="topic",
+            value="露营装备",
+            source="rule",
+        )
+        second = annotation_id(
+            date="2026-06-22",
+            domain_id="camping",
+            note_global_id="ng_note_a",
+            annotation_type="topic",
+            value="露营装备",
+            source="rule",
+        )
+        self.assertEqual(first, second)
+
 
 class TimeParseTests(unittest.TestCase):
     def test_normalize_publish_date(self) -> None:
@@ -308,6 +435,101 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(len(records), 1)
         self.assertEqual(records[0]["note_id"], "a")
         self.assertEqual(records[0]["like_count_num"], 10)
+
+    def test_generate_evidence_from_observations_aggregates_keywords_and_ranks(self) -> None:
+        observations = [
+            {
+                "observation_id": "obs_1",
+                "date": "2026-06-22",
+                "domain_id": "camping",
+                "keyword": "露营",
+                "rank": 3,
+                "note_global_id": "ng_note_a",
+                "note_id": "a",
+                "title": "露营清单",
+                "author": "作者",
+                "like_count": 10,
+            },
+            {
+                "observation_id": "obs_2",
+                "date": "2026-06-22",
+                "domain_id": "camping",
+                "keyword": "露营装备",
+                "rank": 1,
+                "note_global_id": "ng_note_a",
+                "note_id": "a",
+                "title": "露营清单",
+                "author": "作者",
+                "like_count": 12,
+            },
+            {
+                "observation_id": "obs_3",
+                "date": "2026-06-22",
+                "domain_id": "camping",
+                "keyword": "装备推荐",
+                "rank": None,
+                "note_global_id": "ng_note_a",
+                "note_id": "a",
+                "title": "露营清单",
+                "author": "作者",
+            },
+        ]
+        records = generate_evidence_records_from_observations(
+            observations,
+            date_str="2026-06-22",
+            domain_id="camping",
+        )
+        self.assertEqual(len(records), 1)
+        record = records[0]
+        self.assertEqual(record["keywords"], ["装备推荐", "露营", "露营装备"])
+        self.assertEqual(record["best_rank"], 1)
+        self.assertEqual(len(record["all_ranks"]), 3)
+        self.assertEqual(record["source_observation_ids"], ["obs_1", "obs_2", "obs_3"])
+        self.assertEqual(record["like_count_num"], 12)
+        next_day = generate_evidence_records_from_observations(
+            observations,
+            date_str="2026-06-23",
+            domain_id="camping",
+        )[0]
+        self.assertEqual(next_day["note_global_id"], record["note_global_id"])
+        self.assertNotEqual(next_day["evidence_id"], record["evidence_id"])
+
+    def test_generate_evidence_from_observations_merges_clean_annotations(self) -> None:
+        note_global_id = build_note_global_id({"note_id": "a"})
+        observations = [
+            {
+                "observation_id": "obs_1",
+                "date": "2026-06-22",
+                "domain_id": "camping",
+                "keyword": "露营",
+                "rank": 3,
+                "note_global_id": note_global_id,
+                "note_id": "a",
+                "title": "露营清单",
+                "author": "作者",
+            }
+        ]
+        clean_df = pd.DataFrame(
+            [
+                {
+                    "note_id": "a",
+                    "title": "露营清单",
+                    "author": "作者",
+                    "topic_name": "露营装备",
+                    "topic_cluster_id": "taxonomy_rule_露营装备",
+                    "primary_content_pattern": "清单",
+                }
+            ]
+        )
+        record = generate_evidence_records_from_observations(
+            observations,
+            date_str="2026-06-22",
+            domain_id="camping",
+            clean_df=clean_df,
+        )[0]
+        self.assertEqual(record["topic_name"], "露营装备")
+        self.assertEqual(record["topic_cluster_id"], "taxonomy_rule_露营装备")
+        self.assertEqual(record["content_patterns"], ["清单"])
 
     def test_evidence_map_upserts_by_evidence_id(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -515,6 +737,327 @@ class DataQualityTests(unittest.TestCase):
         self.assertFalse(quality["memory_update_allowed"])
 
 
+class QualityGatePipelineTests(unittest.TestCase):
+    def _prepare_root(self, root: Path, *, domain_id: str = "camping") -> Path:
+        config_dir = root / "config"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        (config_dir / "domains.yaml").write_text(
+            f"domains:\n  - id: {domain_id}\n    name: 露营\n    seed_keywords: [露营]\n",
+            encoding="utf-8",
+        )
+        processed = root / "projects" / domain_id / "processed"
+        processed.mkdir(parents=True, exist_ok=True)
+        return processed
+
+    def _patch_project_root(self, root: Path):
+        return patch.multiple(
+            "storage.paths",
+            get_project_root=lambda: root,
+        )
+
+    def _patch_common_root(self, root: Path):
+        return patch.multiple(
+            "pipeline.common",
+            get_project_root=lambda: root,
+        )
+
+    def _write_quality(self, processed: Path, date_str: str, payload: dict) -> None:
+        (processed / f"{date_str}_data_quality.json").write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    def _write_report_inputs(self, processed: Path, date_str: str) -> None:
+        (processed / f"{date_str}_metrics.json").write_text(
+            json.dumps(
+                {
+                    "raw_count": 12,
+                    "clean_count": 8,
+                    "recent_publish_ratio": 0.5,
+                    "high_like_rate": 0.1,
+                    "top_notes": [],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        (processed / f"{date_str}_search_signals.json").write_text(
+            json.dumps(
+                {
+                    "topics": [{"topic": "露营装备", "note_count": 4, "note_share": 0.5, "avg_likes": 100}],
+                    "content_patterns": [{"content_pattern": "清单", "note_count": 3, "note_share": 0.3}],
+                    "top_authors": [],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+    def test_invalid_report_is_skipped_at_module_entry(self) -> None:
+        from pipeline.generate_market_report import main as report_main
+
+        date_str = "2026-06-22"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            processed = self._prepare_root(root)
+            self._write_quality(
+                processed,
+                date_str,
+                {"quality_level": "invalid", "report_allowed": False, "memory_update_allowed": False},
+            )
+            with self._patch_project_root(root), self._patch_common_root(root), patch.object(
+                sys, "argv", ["generate_market_report", "--domain", "camping", "--date", date_str]
+            ):
+                self.assertEqual(report_main(), 0)
+
+            self.assertFalse((processed / f"{date_str}_market_analysis.json").exists())
+            self.assertTrue((processed / f"{date_str}_market_report_skipped.json").exists())
+            status = json.loads((processed / f"{date_str}_pipeline_status.json").read_text(encoding="utf-8"))
+            self.assertEqual(status["steps"][0]["status"], "skipped")
+
+    def test_invalid_memory_is_skipped_at_module_entry(self) -> None:
+        from pipeline.update_memory import main as memory_main
+
+        date_str = "2026-06-22"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            processed = self._prepare_root(root)
+            self._write_quality(
+                processed,
+                date_str,
+                {"quality_level": "invalid", "report_allowed": False, "memory_update_allowed": False},
+            )
+            with self._patch_project_root(root), self._patch_common_root(root), patch.object(
+                sys, "argv", ["update_memory", "--domain", "camping", "--date", date_str]
+            ):
+                self.assertEqual(memory_main(), 0)
+
+            self.assertTrue((processed / f"{date_str}_memory_update_skipped.json").exists())
+            self.assertFalse((root / "projects" / "camping" / "memory" / "daily" / f"{date_str}_summary.json").exists())
+            self.assertFalse((root / "projects" / "camping" / "memory" / "judgments" / "judgments.jsonl").exists())
+
+    def test_low_quality_generates_weak_report(self) -> None:
+        from pipeline.generate_market_report import main as report_main
+
+        date_str = "2026-06-22"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            processed = self._prepare_root(root)
+            self._write_quality(
+                processed,
+                date_str,
+                {
+                    "quality_level": "low",
+                    "report_allowed": True,
+                    "memory_update_allowed": False,
+                    "warnings": ["clean_count_lt_10"],
+                },
+            )
+            self._write_report_inputs(processed, date_str)
+            with self._patch_project_root(root), self._patch_common_root(root), patch.object(
+                sys, "argv", ["generate_market_report", "--domain", "camping", "--date", date_str]
+            ), patch("pipeline.generate_market_report.analyze_market_context_with_llm", return_value={"enabled": False}):
+                self.assertEqual(report_main(), 0)
+
+            report = (
+                root
+                / "projects"
+                / "camping"
+                / "reports"
+                / "market"
+                / f"{date_str}_小红书市场局势报告.md"
+            ).read_text(encoding="utf-8")
+            self.assertIn("数据质量：low", report)
+            self.assertIn("样本量不足或质量较低", report)
+
+    def test_low_quality_memory_keeps_current_state_unchanged(self) -> None:
+        from pipeline.update_memory import main as memory_main
+
+        date_str = "2026-06-22"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            processed = self._prepare_root(root)
+            self._write_quality(
+                processed,
+                date_str,
+                {"quality_level": "low", "report_allowed": True, "memory_update_allowed": False},
+            )
+            self._write_report_inputs(processed, date_str)
+            (processed / f"{date_str}_market_analysis.json").write_text("{}", encoding="utf-8")
+            current_state = root / "projects" / "camping" / "memory" / "current_state.md"
+            current_state.parent.mkdir(parents=True, exist_ok=True)
+            current_state.write_text("# old state\n", encoding="utf-8")
+            with self._patch_project_root(root), self._patch_common_root(root), patch.object(
+                sys, "argv", ["update_memory", "--domain", "camping", "--date", date_str]
+            ):
+                self.assertEqual(memory_main(), 0)
+
+            self.assertEqual(current_state.read_text(encoding="utf-8"), "# old state\n")
+            summary = json.loads(
+                (root / "projects" / "camping" / "memory" / "daily" / f"{date_str}_summary.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertTrue(summary["memory_update_skipped"])
+            self.assertFalse((root / "projects" / "camping" / "memory" / "judgments" / "judgments.jsonl").exists())
+
+    def test_high_quality_memory_keeps_normal_path(self) -> None:
+        from pipeline.update_memory import main as memory_main
+
+        date_str = "2026-06-22"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            processed = self._prepare_root(root)
+            self._write_quality(
+                processed,
+                date_str,
+                {"quality_level": "high", "report_allowed": True, "memory_update_allowed": True},
+            )
+            self._write_report_inputs(processed, date_str)
+            (processed / f"{date_str}_market_analysis.json").write_text(
+                json.dumps({"situation_summary": [{"summary": "搜索页样本中露营装备较集中。"}]}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            with self._patch_project_root(root), self._patch_common_root(root), patch.object(
+                sys, "argv", ["update_memory", "--domain", "camping", "--date", date_str]
+            ):
+                self.assertEqual(memory_main(), 0)
+
+            self.assertTrue((root / "projects" / "camping" / "memory" / "current_state.md").exists())
+            self.assertTrue((root / "projects" / "camping" / "memory" / "judgments" / "judgments.jsonl").exists())
+
+    def test_missing_quality_file_blocks_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._prepare_root(root)
+            with self._patch_project_root(root):
+                gate = load_quality_gate("camping", "2026-06-22")
+            self.assertEqual(gate.status, "missing")
+            self.assertFalse(gate.report_allowed)
+            self.assertFalse(gate.memory_update_allowed)
+
+    def test_malformed_quality_file_blocks_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            processed = self._prepare_root(root)
+            (processed / "2026-06-22_data_quality.json").write_text("{bad json", encoding="utf-8")
+            with self._patch_project_root(root):
+                gate = load_quality_gate("camping", "2026-06-22")
+            self.assertEqual(gate.status, "malformed")
+            self.assertFalse(gate.report_allowed)
+            self.assertFalse(gate.memory_update_allowed)
+
+
+class CleanArtifactImmutabilityTests(unittest.TestCase):
+    def _prepare_root(self, root: Path, *, domain_id: str = "camping", date_str: str = "2026-06-22") -> Path:
+        processed = root / "projects" / domain_id / "processed"
+        processed.mkdir(parents=True, exist_ok=True)
+        memory = root / "projects" / domain_id / "memory"
+        memory.mkdir(parents=True, exist_ok=True)
+        df = pd.DataFrame(
+            [
+                {
+                    "note_id": "n1",
+                    "title": "露营装备清单",
+                    "author": "作者A",
+                    "author_id": "u1",
+                    "link": "https://xhs.example/n1",
+                    "keyword": "露营",
+                    "rank": 1,
+                    "publish_date": "2026-06-21",
+                    "like_count_num": 100,
+                    "collect_count_num": 20,
+                    "comment_count_num": 5,
+                    "share_count_num": 1,
+                    "topic_name": "露营装备",
+                    "topic_cluster_id": "taxonomy_rule_露营装备",
+                    "is_video": False,
+                    "quality_score": 100,
+                }
+            ]
+        )
+        df.to_excel(processed / f"{date_str}_clean_notes.xlsx", index=False)
+        df.to_csv(processed / f"{date_str}_clean_notes.csv", index=False, encoding="utf-8-sig")
+        return processed
+
+    def _patch_project_root(self, root: Path):
+        return patch.multiple("storage.paths", get_project_root=lambda: root)
+
+    def test_downstream_steps_do_not_mutate_base_clean(self) -> None:
+        from pipeline.apply_manual_corrections import main as corrections_main
+        from pipeline.analyze_images import main as images_main
+        from pipeline.compute_search_page_signals import main as signals_main
+        from pipeline.generate_evidence import main as evidence_main
+
+        date_str = "2026-06-22"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            processed = self._prepare_root(root, date_str=date_str)
+            corrections_path = root / "projects" / "camping" / "memory" / "manual_corrections.jsonl"
+            corrections_path.write_text(
+                json.dumps(
+                    {
+                        "id": "fix_pattern",
+                        "match": {"note_id": "n1"},
+                        "set": {"content_pattern": "清单"},
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            base_path = processed / f"{date_str}_clean_notes.xlsx"
+            original_bytes = base_path.read_bytes()
+            with self._patch_project_root(root), patch.object(
+                sys, "argv", ["apply_manual_corrections", "--domain", "camping", "--date", date_str]
+            ):
+                self.assertEqual(corrections_main(), 0)
+            self.assertEqual(base_path.read_bytes(), original_bytes)
+            self.assertTrue((processed / f"{date_str}_clean_notes_corrected.xlsx").exists())
+
+            with self._patch_project_root(root), patch.object(
+                sys, "argv", ["analyze_images", "--domain", "camping", "--date", date_str, "--download"]
+            ), patch("pipeline.analyze_images.download_cover_images", side_effect=lambda df, *_args: df):
+                self.assertEqual(images_main(), 0)
+            self.assertEqual(base_path.read_bytes(), original_bytes)
+            self.assertTrue((processed / f"{date_str}_clean_notes_image_enriched.xlsx").exists())
+
+            with self._patch_project_root(root), patch.object(
+                sys, "argv", ["compute_search_page_signals", "--domain", "camping", "--date", date_str]
+            ):
+                self.assertEqual(signals_main(), 0)
+            self.assertEqual(base_path.read_bytes(), original_bytes)
+            self.assertTrue((processed / f"{date_str}_search_signals.json").exists())
+
+            with self._patch_project_root(root), patch.object(
+                sys, "argv", ["generate_evidence", "--domain", "camping", "--date", date_str]
+            ):
+                self.assertEqual(evidence_main(), 0)
+            self.assertEqual(base_path.read_bytes(), original_bytes)
+            self.assertTrue((root / "projects" / "camping" / "memory" / "evidence" / f"{date_str}_evidence.jsonl").exists())
+
+    def test_clean_rerun_removes_stale_derived_variants(self) -> None:
+        from pipeline.clean_artifacts import clean_derived_path
+        from pipeline.clean_notes import save_clean
+
+        date_str = "2026-06-22"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            processed = self._prepare_root(root, date_str=date_str)
+            corrected = processed / f"{date_str}_clean_notes_corrected.xlsx"
+            image_enriched = processed / f"{date_str}_clean_notes_image_enriched.xlsx"
+            pd.DataFrame([{"note_id": "old"}]).to_excel(corrected, index=False)
+            pd.DataFrame([{"note_id": "old"}]).to_excel(image_enriched, index=False)
+            self.assertTrue(clean_derived_path(date_str, "camping", "corrected").name.endswith("corrected.xlsx"))
+
+            with self._patch_project_root(root):
+                save_clean(pd.DataFrame([{"note_id": "new"}]), date_str, "camping")
+
+            self.assertFalse(corrected.exists())
+            self.assertFalse(image_enriched.exists())
+
+
 class ManualCorrectionTests(unittest.TestCase):
     def test_manual_correction_updates_topic_and_pattern(self) -> None:
         df = pd.DataFrame(
@@ -606,6 +1149,55 @@ class MarketReportTests(unittest.TestCase):
         self.assertNotIn("raw_notes", payload)
         self.assertNotIn("clean_notes", payload)
 
+    def test_llm_input_includes_structured_state_and_rollups(self) -> None:
+        import analysis.llm_context_builder as builder
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "projects" / "camping"
+            processed = root / "processed"
+            memory = root / "memory"
+            rollups = memory / "rollups"
+            evidence = memory / "evidence"
+            processed.mkdir(parents=True, exist_ok=True)
+            rollups.mkdir(parents=True, exist_ok=True)
+            evidence.mkdir(parents=True, exist_ok=True)
+            (processed / "2026-06-24_metrics.json").write_text("{}", encoding="utf-8")
+            (processed / "2026-06-24_search_signals.json").write_text("{}", encoding="utf-8")
+            (processed / "2026-06-24_data_quality.json").write_text(
+                json.dumps({"quality_level": "high"}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            (memory / "current_state.json").write_text(
+                json.dumps({"last_updated": "2026-06-23", "top_topics": [{"topic": "露营装备"}]}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            weekly = {
+                "period_type": "weekly",
+                "period_key": "2026-W26",
+                "end_date": "2026-06-24",
+                "avg_clean_count": 10,
+                "top_topics": [{"topic": "露营装备", "score": 4}],
+            }
+            monthly = {
+                "period_type": "monthly",
+                "period_key": "2026-06",
+                "end_date": "2026-06-24",
+                "avg_clean_count": 20,
+                "top_topics": [{"topic": "露营装备", "score": 12}],
+            }
+            (rollups / "weekly_2026-W26_metrics.json").write_text(json.dumps(weekly, ensure_ascii=False), encoding="utf-8")
+            (rollups / "monthly_2026-06_metrics.json").write_text(json.dumps(monthly, ensure_ascii=False), encoding="utf-8")
+            with patch.object(builder, "processed_dir", lambda domain_id: processed), patch.object(
+                builder, "memory_dir", lambda domain_id: memory
+            ), patch.object(builder, "memory_rollups_dir", lambda domain_id: rollups), patch.object(
+                builder, "evidence_dir", lambda domain_id: evidence
+            ):
+                payload = build_llm_input(domain_id="camping", date_str="2026-06-24", domain={"name": "露营"})
+            self.assertEqual(payload["previous_state_as_of"], "2026-06-23")
+            self.assertEqual(payload["recent_week_rollup"]["period_key"], "2026-W26")
+            self.assertEqual(payload["recent_month_rollup"]["period_key"], "2026-06")
+            self.assertEqual(payload["period_comparison"]["shared_topics"][0]["topic"], "露营装备")
+
     def test_market_analysis_validation_filters_bad_evidence_ids(self) -> None:
         llm_input = {
             "representative_evidence": [
@@ -667,9 +1259,13 @@ class MemoryTests(unittest.TestCase):
             market_analysis=market_analysis,
         )
         state = render_current_state(domain={"id": "camping", "name": "露营"}, daily_summary=summary)
+        payload = build_current_state_payload(domain={"id": "camping", "name": "露营"}, daily_summary=summary)
+        rendered_from_json = render_current_state_from_payload(payload)
         self.assertTrue(summary["data_quality"]["memory_update_allowed"])
         self.assertIn("露营装备", state)
         self.assertIn("ev_20260622_camping_search_abc", state)
+        self.assertEqual(state, rendered_from_json)
+        self.assertEqual(payload["schema_version"], 1)
 
     def test_conflict_queue_records_low_quality_observation(self) -> None:
         summary = {
@@ -724,6 +1320,8 @@ class MemoryTests(unittest.TestCase):
         )
         self.assertTrue(third_day_decision["allowed"])
         self.assertEqual(third_day_decision["confirmed_disappeared_topics"], ["露营装备"])
+        self.assertIn("露营装备", third_day_decision["cooling_evidence"])
+        self.assertGreaterEqual(third_day_decision["cooling_evidence"]["露营装备"]["recent_valid_days_checked"], 3)
 
     def test_first_three_valid_observation_days_need_verification(self) -> None:
         quality = {"quality_level": "high", "memory_update_allowed": True}
@@ -811,6 +1409,85 @@ class MemoryTests(unittest.TestCase):
             overview = paths["domain_overview"].read_text(encoding="utf-8")
             self.assertIn("露营装备", overview)
             self.assertIn("ev_1", overview)
+
+
+class MemoryAppendIdempotencyTests(unittest.TestCase):
+    def _prepare_root(self, root: Path, *, domain_id: str = "camping", date_str: str = "2026-06-22") -> None:
+        config_dir = root / "config"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        (config_dir / "domains.yaml").write_text(
+            f"domains:\n  - id: {domain_id}\n    name: 露营\n    seed_keywords: [露营]\n",
+            encoding="utf-8",
+        )
+        processed = root / "projects" / domain_id / "processed"
+        processed.mkdir(parents=True, exist_ok=True)
+        (processed / f"{date_str}_data_quality.json").write_text(
+            json.dumps({"quality_level": "high", "report_allowed": True, "memory_update_allowed": True}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        (processed / f"{date_str}_metrics.json").write_text(
+            json.dumps({"raw_count": 12, "clean_count": 12}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        (processed / f"{date_str}_search_signals.json").write_text(
+            json.dumps(
+                {
+                    "topics": [{"topic": "露营装备", "note_count": 5, "note_share": 0.4, "avg_likes": 100}],
+                    "content_patterns": [{"content_pattern": "清单", "note_count": 4, "note_share": 0.3}],
+                    "top_authors": [{"name": "作者A", "author_key": "xhs_user:u1", "author_id": "u1", "count": 2}],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        (processed / f"{date_str}_market_analysis.json").write_text(
+            json.dumps({"situation_summary": [{"summary": "搜索页样本中露营装备较集中。"}]}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+    def _patch_project_root(self, root: Path):
+        return patch.multiple("storage.paths", get_project_root=lambda: root)
+
+    def _patch_common_root(self, root: Path):
+        return patch.multiple("pipeline.common", get_project_root=lambda: root)
+
+    def test_append_jsonl_upserts_by_record_id(self) -> None:
+        from analysis.memory import append_jsonl
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "records.jsonl"
+            append_jsonl(path, {"record_id": "r1", "value": 1})
+            append_jsonl(path, {"record_id": "r1", "value": 2})
+            records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["value"], 2)
+
+    def test_update_memory_same_day_rerun_has_no_duplicate_long_term_records(self) -> None:
+        from pipeline.update_memory import main as memory_main
+
+        date_str = "2026-06-22"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._prepare_root(root, date_str=date_str)
+            argv = ["update_memory", "--domain", "camping", "--date", date_str]
+            with self._patch_project_root(root), self._patch_common_root(root), patch.object(sys, "argv", argv):
+                self.assertEqual(memory_main(), 0)
+            memory_root = root / "projects" / "camping" / "memory"
+            current_state_path = memory_root / "current_state.md"
+            current_state_json_path = memory_root / "current_state.json"
+            first_state = current_state_path.read_text(encoding="utf-8")
+
+            with self._patch_project_root(root), self._patch_common_root(root), patch.object(sys, "argv", argv):
+                self.assertEqual(memory_main(), 0)
+
+            judgments = (memory_root / "judgments" / "judgments.jsonl").read_text(encoding="utf-8").splitlines()
+            trend_events = (memory_root / "trends" / "trend_events.jsonl").read_text(encoding="utf-8").splitlines()
+            wiki_log = (memory_root / "wiki" / "log.md").read_text(encoding="utf-8")
+            self.assertEqual(len(judgments), 1)
+            self.assertEqual(len(trend_events), 3)
+            self.assertEqual(wiki_log.count("log_id:"), 1)
+            self.assertEqual(current_state_path.read_text(encoding="utf-8"), first_state)
+            self.assertEqual(json.loads(current_state_json_path.read_text(encoding="utf-8"))["last_updated"], date_str)
 
 
 class RollupTests(unittest.TestCase):
@@ -1042,6 +1719,85 @@ class SchedulerTests(unittest.TestCase):
         early, early_reason = is_due({"schedule": {"schedule_enabled": True, "preferred_time": "10:30"}}, now=now)
         self.assertFalse(early)
         self.assertEqual(early_reason, "before_preferred_time")
+
+    def test_step_registry_builds_scheduler_default_plan(self) -> None:
+        plan_names = step_names(build_step_plan(scheduled_defaults=True))
+        self.assertEqual(plan_names, list(DEFAULT_SCHEDULED_STEPS))
+        self.assertIn("evaluate_rules", plan_names)
+        self.assertIn("update_memory", plan_names)
+        self.assertNotIn("analyze_images", plan_names)
+        self.assertLess(plan_names.index("compute_search_page_signals"), plan_names.index("evaluate_rules"))
+        self.assertLess(plan_names.index("suggest_rule_candidates"), plan_names.index("generate_evidence"))
+
+    def test_step_registry_optional_plan_and_commands(self) -> None:
+        plan_names = step_names(build_step_plan({"sample_detail_pages", "analyze_images", "update_memory", "update_rollups"}))
+        self.assertIn("sample_detail_pages", plan_names)
+        self.assertIn("analyze_images", plan_names)
+        self.assertNotIn("generate_market_report", plan_names)
+        self.assertLess(plan_names.index("sample_detail_pages"), plan_names.index("analyze_images"))
+        self.assertIn("--enable", build_step_command("sample_detail_pages", domain_id="camping", date_value="today", py="python"))
+        self.assertIn("--download", build_step_command("analyze_images", domain_id="camping", date_value="today", py="python"))
+        scheduled_daily = build_step_command("run_daily", domain_id="camping", date_value="today", py="python", scheduled=True)
+        self.assertIn("--scheduled", scheduled_daily)
+        self.assertIn("--once-per-day", scheduled_daily)
+
+    def test_pipeline_runner_writes_status_and_manifest_on_dry_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            plan = build_step_plan(set())[:2]
+            with patch.multiple("storage.paths", get_project_root=lambda: root):
+                runner = PipelineRunner(
+                    domain_id="camping",
+                    date_value="2026-06-22",
+                    date_str="2026-06-22",
+                    plan=plan,
+                    py="python",
+                    dry_run=True,
+                )
+                self.assertEqual(runner.run(), 0)
+            processed = root / "projects" / "camping" / "processed"
+            status = json.loads((processed / "2026-06-22_pipeline_status.json").read_text(encoding="utf-8"))
+            manifest = json.loads((processed / "2026-06-22_artifact_manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual([step["status"] for step in status["steps"]], ["skipped", "skipped"])
+            self.assertEqual(manifest["steps"][0]["status"], "skipped")
+            self.assertTrue(manifest["run_id"].startswith("run_20260622_camping_"))
+
+    def test_pipeline_runner_preserves_subprocess_skipped_status(self) -> None:
+        from analysis.pipeline_status import update_step
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            plan = [step for step in build_step_plan({"generate_market_report"}) if step.name == "generate_market_report"]
+
+            def fake_run(*_args, **_kwargs):
+                update_step(
+                    "camping",
+                    "2026-06-22",
+                    "generate_market_report",
+                    status="skipped",
+                    exit_code=0,
+                    error="quality_gate",
+                )
+                return subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+
+            with patch.multiple("storage.paths", get_project_root=lambda: root), patch(
+                "pipeline.runner.subprocess.run",
+                side_effect=fake_run,
+            ):
+                runner = PipelineRunner(
+                    domain_id="camping",
+                    date_value="2026-06-22",
+                    date_str="2026-06-22",
+                    plan=plan,
+                    py="python",
+                )
+                self.assertEqual(runner.run(), 0)
+            processed = root / "projects" / "camping" / "processed"
+            status = json.loads((processed / "2026-06-22_pipeline_status.json").read_text(encoding="utf-8"))
+            manifest = json.loads((processed / "2026-06-22_artifact_manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(status["steps"][0]["status"], "skipped")
+            self.assertEqual(manifest["steps"][0]["status"], "skipped")
 
     def test_windows_task_command_builder(self) -> None:
         run_command = build_task_run_command(

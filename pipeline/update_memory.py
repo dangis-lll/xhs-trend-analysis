@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -9,10 +10,11 @@ from typing import Any
 from analysis.memory import (
     append_jsonl,
     build_conflict_records,
+    build_current_state_payload,
     build_daily_summary,
     build_judgment_record,
     decide_current_state_update,
-    render_current_state,
+    render_current_state_from_payload,
 )
 from analysis.trend_store import (
     append_events_jsonl,
@@ -34,7 +36,10 @@ from analysis.trend_store import (
     upsert_index_csv,
 )
 from analysis.wiki_memory import update_wiki_files
+from analysis.pipeline_status import update_step
 from pipeline.common import get_domain
+from pipeline.quality_gate import load_quality_gate, write_skip_artifact
+from storage.atomic_io import atomic_write_json
 from storage.paths import (
     ensure_dirs,
     judgments_dir,
@@ -80,11 +85,32 @@ def load_recent_daily_summaries(domain_id: str, before_date: str, limit: int = 1
     return summaries[-limit:]
 
 
+def _current_state_date(text: str) -> str:
+    match = re.search(r"^- last_updated:\s*`([^`]+)`", text, flags=re.MULTILINE)
+    return match.group(1).strip() if match else ""
+
+
 def main() -> int:
     args = parse_args()
     date_str = normalize_date(args.date)
     try:
         ensure_dirs(date_str, args.domain)
+        gate = load_quality_gate(args.domain, date_str)
+        if gate.quality_level != "low" and not gate.memory_update_allowed:
+            reason = ";".join(gate.reasons) or "memory_blocked_by_quality_gate"
+            skip_path = processed_dir(args.domain) / f"{date_str}_memory_update_skipped.json"
+            write_skip_artifact(
+                skip_path,
+                domain_id=args.domain,
+                date_str=date_str,
+                step="update_memory",
+                gate=gate,
+            )
+            update_step(args.domain, date_str, "update_memory", status="skipped", exit_code=0, error=reason)
+            print(f"记忆更新已跳过：{reason}")
+            print(f"已保存跳过记录：{skip_path}")
+            return 0
+
         domain = get_domain(args.domain)
         processed = processed_dir(args.domain)
         metrics = load_json(processed / f"{date_str}_metrics.json", {})
@@ -100,6 +126,26 @@ def main() -> int:
             data_quality=data_quality,
             market_analysis=market_analysis,
         )
+        if not gate.memory_update_allowed:
+            daily_summary["verification_status"] = "low_confidence"
+            daily_summary["valid_observation_days"] = 0
+            daily_summary["memory_update_skipped"] = True
+            daily_summary["skip_reason"] = ";".join(gate.reasons) or "memory_blocked_by_quality_gate"
+            daily_path = memory_daily_dir(args.domain) / f"{date_str}_summary.json"
+            daily_path.parent.mkdir(parents=True, exist_ok=True)
+            daily_path.write_text(json.dumps(daily_summary, ensure_ascii=False, indent=2), encoding="utf-8")
+            update_step(
+                args.domain,
+                date_str,
+                "update_memory",
+                status="skipped",
+                exit_code=0,
+                error=daily_summary["skip_reason"],
+            )
+            print(f"已保存低置信每日摘要：{daily_path}")
+            print(f"长期记忆更新已跳过：{daily_summary['skip_reason']}")
+            return 0
+
         daily_path = memory_daily_dir(args.domain) / f"{date_str}_summary.json"
         daily_path.parent.mkdir(parents=True, exist_ok=True)
         daily_path.write_text(json.dumps(daily_summary, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -119,10 +165,14 @@ def main() -> int:
         should_update = bool(update_decision.get("allowed"))
         if should_update:
             current_state_path.parent.mkdir(parents=True, exist_ok=True)
-            current_state_path.write_text(
-                render_current_state(domain=domain, daily_summary=daily_summary, previous_text=previous_text),
-                encoding="utf-8",
+            previous_for_render = "" if _current_state_date(previous_text) == date_str else previous_text
+            current_state_payload = build_current_state_payload(
+                domain=domain,
+                daily_summary=daily_summary,
+                previous_text=previous_for_render,
             )
+            atomic_write_json(memory_dir(args.domain) / "current_state.json", current_state_payload)
+            current_state_path.write_text(render_current_state_from_payload(current_state_payload), encoding="utf-8")
         current_state_text = current_state_path.read_text(encoding="utf-8") if current_state_path.exists() else ""
 
         judgment = build_judgment_record(
@@ -224,7 +274,9 @@ def main() -> int:
             event="memory_update" if should_update else "memory_observation_only",
             details=f"reason={update_decision.get('reason', 'unknown')}; updated_current_state={should_update}",
         )
+        update_step(args.domain, date_str, "update_memory", status="success", exit_code=0)
     except Exception as exc:
+        update_step(args.domain, date_str, "update_memory", status="failed", exit_code=1, error=str(exc))
         print(f"记忆更新失败：{exc}", file=sys.stderr)
         return 1
 

@@ -13,7 +13,8 @@ from analysis.detail_sampling import (
     merge_manual_detail_supplements,
     select_detail_sample_targets,
 )
-from storage.paths import details_dir, ensure_dirs, normalize_date, processed_dir
+from pipeline.clean_artifacts import resolve_clean_path
+from storage.paths import details_dir, ensure_dirs, normalize_date
 
 
 def parse_args() -> argparse.Namespace:
@@ -46,9 +47,7 @@ def main() -> int:
             print(f"详情页抽样未启用，已记录状态：{status_path}")
             return 0
 
-        clean_path = processed_dir(args.domain) / f"{date_str}_clean_notes.xlsx"
-        if not clean_path.exists():
-            raise FileNotFoundError(f"找不到清洗结果：{clean_path}")
+        clean_path = resolve_clean_path(date_str, args.domain)
         clean_df = pd.read_excel(clean_path)
         targets = select_detail_sample_targets(clean_df, limit=args.limit)
         supplements = load_manual_detail_supplements(Path(args.manual_supplements)) if args.manual_supplements else []

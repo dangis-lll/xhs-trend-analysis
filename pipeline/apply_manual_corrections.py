@@ -7,6 +7,7 @@ import sys
 import pandas as pd
 
 from analysis.manual_corrections import apply_manual_corrections, load_corrections
+from pipeline.clean_artifacts import load_clean_dataframe, write_clean_variant
 from storage.paths import memory_dir, normalize_date, processed_dir
 
 
@@ -18,10 +19,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def load_clean(date_str: str, domain_id: str) -> pd.DataFrame:
-    path = processed_dir(domain_id) / f"{date_str}_clean_notes.xlsx"
-    if not path.exists():
-        raise FileNotFoundError(f"找不到清洗结果：{path}")
-    return pd.read_excel(path)
+    return load_clean_dataframe(date_str, domain_id, prefer_derived=False)
 
 
 def main() -> int:
@@ -33,11 +31,8 @@ def main() -> int:
         corrections = load_corrections(corrections_path)
         corrected_df, applied = apply_manual_corrections(clean_df, corrections)
 
-        xlsx_path = processed_dir(args.domain) / f"{date_str}_clean_notes.xlsx"
-        csv_path = processed_dir(args.domain) / f"{date_str}_clean_notes.csv"
+        xlsx_path, csv_path = write_clean_variant(corrected_df, date_str, args.domain, "corrected")
         applied_path = processed_dir(args.domain) / f"{date_str}_manual_corrections_applied.json"
-        corrected_df.to_excel(xlsx_path, index=False)
-        corrected_df.to_csv(csv_path, index=False, encoding="utf-8-sig")
         applied_path.write_text(json.dumps(applied, ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception as exc:
         print(f"人工纠错应用失败：{exc}", file=sys.stderr)
@@ -45,6 +40,7 @@ def main() -> int:
 
     print(f"已读取人工纠错文件：{corrections_path}")
     print(f"已应用纠错记录：{len(applied)} 条")
+    print(f"已保存纠错后清洗结果：{xlsx_path}")
     print(f"已保存纠错日志：{applied_path}")
     return 0
 
